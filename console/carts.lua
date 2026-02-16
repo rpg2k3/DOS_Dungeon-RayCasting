@@ -6,9 +6,17 @@ function carts.register(cart)
     carts.list[#carts.list + 1] = cart
 end
 
+local function tryLoad(moduleName)
+    local ok, cart = pcall(require, moduleName)
+    if ok and cart then
+        carts.register(cart)
+    else
+        print("Warning: failed to load cart: " .. moduleName)
+    end
+end
+
 function carts.init()
-    carts.register(require("carts.dos_dungeon"))
-    carts.register(require("carts.raycast_dungeon"))
+    tryLoad("carts.raycast_dungeon")
 end
 
 function carts.get(index)
