@@ -273,7 +273,7 @@ local function drawPaused()
     end
 
     -- hint
-    gfx.print("ESC:PAUSE  B:MENU", px + 10, py + ph - 14, theme.C.disabled)
+    gfx.print("START:PAUSE  B:MENU", px + 10, py + ph - 14, theme.C.disabled)
 end
 
 ----------------------------------------------------------------
@@ -369,10 +369,30 @@ end
 
 function app.keypressed(key)
     input.keypressed(key)
+    -- Forward raw keypresses to cart (for edit mode keys like F1, S, L, R, P)
+    if state == "RUNNING" and currentCart and currentCart.keypressed then
+        currentCart.keypressed(key)
+    end
 end
 
 function app.keyreleased(key)
     input.keyreleased(key)
+end
+
+function app.gamepadpressed(joy, button)
+    input.gamepadpressed(joy, button)
+end
+
+function app.gamepadreleased(joy, button)
+    input.gamepadreleased(joy, button)
+end
+
+function app.joystickadded(joy)
+    input.joystickadded(joy)
+end
+
+function app.joystickremoved(joy)
+    input.joystickremoved(joy)
 end
 
 function app.resize(w, h)

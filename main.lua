@@ -21,6 +21,22 @@ function love.keyreleased(key)
     app.keyreleased(key)
 end
 
+function love.gamepadpressed(joy, button)
+    app.gamepadpressed(joy, button)
+end
+
+function love.gamepadreleased(joy, button)
+    app.gamepadreleased(joy, button)
+end
+
+function love.joystickadded(joy)
+    app.joystickadded(joy)
+end
+
+function love.joystickremoved(joy)
+    app.joystickremoved(joy)
+end
+
 function love.resize(w, h)
     app.resize(w, h)
 end
