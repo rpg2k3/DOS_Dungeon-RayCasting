@@ -32,6 +32,32 @@ local MAX_DIST  = 20
 local MOVE_SPEED = 3.0
 local ROT_SPEED  = 2.5
 
+-- Tile types
+local TILE_EMPTY  = 0
+local TILE_WALL   = 1
+local TILE_DOOR   = 2
+local TILE_STAIRS = 3
+local TILE_START  = 4
+
+local TILE_NAMES = {
+    [TILE_EMPTY]  = "EMPTY",
+    [TILE_WALL]   = "WALL",
+    [TILE_DOOR]   = "DOOR",
+    [TILE_STAIRS] = "STAIRS",
+    [TILE_START]  = "START",
+}
+
+-- Palette colors per tile type (for editor grid)
+local TILE_COLORS = {
+    [TILE_EMPTY]  = 0,   -- black
+    [TILE_WALL]   = 7,   -- light gray
+    [TILE_DOOR]   = 9,   -- blue
+    [TILE_STAIRS] = 14,  -- yellow
+    [TILE_START]  = 10,  -- green
+}
+
+local BRUSH_ORDER = { TILE_WALL, TILE_EMPTY, TILE_DOOR, TILE_STAIRS, TILE_START }
+
 -- ============================================================================
 -- STATE
 -- ============================================================================
@@ -55,6 +81,12 @@ local zBuffer
 
 -- Texture data cache (ImageData for floor/ceil pixel sampling)
 local floorTexData, ceilTexData
+
+-- Edit mode state
+local mode          -- "play" or "edit"
+local cursorX, cursorY
+local brushType
+local playerStartX, playerStartY
 
 -- ============================================================================
 -- HELPERS
@@ -140,8 +172,104 @@ local function getTile(mx, my)
     return map[(my - 1) * mapW + mx]
 end
 
+local function setTile(mx, my, val)
+    if mx < 1 or my < 1 or mx > mapW or my > mapH then return end
+    map[(my - 1) * mapW + mx] = val
+end
+
 local function isWall(mx, my)
-    return getTile(mx, my) == 1
+    return getTile(mx, my) == TILE_WALL
+end
+
+-- ============================================================================
+-- SAVE / LOAD MAP
+-- ============================================================================
+local function serializeMap()
+    local lines = {}
+    lines[#lines + 1] = "return {"
+    lines[#lines + 1] = "  width = " .. mapW .. ","
+    lines[#lines + 1] = "  height = " .. mapH .. ","
+    lines[#lines + 1] = "  playerStart = {x = " .. playerStartX .. ", y = " .. playerStartY .. "},"
+    lines[#lines + 1] = "  grid = {"
+    for y = 1, mapH do
+        local row = {}
+        for x = 1, mapW do
+            row[#row + 1] = tostring(getTile(x, y))
+        end
+        lines[#lines + 1] = "    " .. table.concat(row, ",") .. ","
+    end
+    lines[#lines + 1] = "  },"
+    lines[#lines + 1] = "}"
+    return table.concat(lines, "\n") .. "\n"
+end
+
+local function saveMap()
+    love.filesystem.createDirectory("dungeons")
+    local content = serializeMap()
+    local ok, err = love.filesystem.write("dungeons/main.lua", content)
+    if ok then
+        addLog("MAP SAVED!")
+    else
+        addLog("SAVE FAILED: " .. tostring(err))
+    end
+end
+
+local function loadMapFromFile()
+    local info = love.filesystem.getInfo("dungeons/main.lua")
+    if not info then return false end
+    local content = love.filesystem.read("dungeons/main.lua")
+    if not content then return false end
+    local fn, err = load(content)
+    if not fn then
+        addLog("LOAD ERR: " .. tostring(err))
+        return false
+    end
+    local ok, result = pcall(fn)
+    if not ok or type(result) ~= "table" then
+        addLog("LOAD ERR: BAD DATA")
+        return false
+    end
+    if not result.width or not result.height or not result.grid then
+        addLog("LOAD ERR: MISSING FIELDS")
+        return false
+    end
+    mapW = result.width
+    mapH = result.height
+    map = {}
+    for i, v in ipairs(result.grid) do
+        map[i] = v
+    end
+    if result.playerStart then
+        playerStartX = result.playerStart.x or 2
+        playerStartY = result.playerStart.y or 2
+    end
+    -- Find START tile if present (overrides playerStart)
+    for y = 1, mapH do
+        for x = 1, mapW do
+            if getTile(x, y) == TILE_START then
+                playerStartX = x
+                playerStartY = y
+            end
+        end
+    end
+    return true
+end
+
+local function loadMapDefault()
+    mapW = DEFAULT_MAP.width
+    mapH = DEFAULT_MAP.height
+    map = {}
+    for i, v in ipairs(DEFAULT_MAP.tiles) do
+        map[i] = v
+    end
+    playerStartX = 2
+    playerStartY = 2
+end
+
+local function applyPlayerStart()
+    player.x = playerStartX + 0.5
+    player.y = playerStartY + 0.5
+    player.angle = 0
 end
 
 -- ============================================================================
@@ -385,11 +513,8 @@ local function drawMinimap()
             if px >= mx and py >= my and px + cellSize <= mx + mw and py + cellSize <= my + mh then
                 if wx >= 1 and wy >= 1 and wx <= mapW and wy <= mapH then
                     local tile = getTile(wx, wy)
-                    if tile == 1 then
-                        gfx.rect(px, py, cellSize, cellSize, 7)
-                    else
-                        gfx.rect(px, py, cellSize, cellSize, 8)
-                    end
+                    local col = TILE_COLORS[tile] or 0
+                    gfx.rect(px, py, cellSize, cellSize, col)
                 end
             end
         end
@@ -470,6 +595,116 @@ local function loadTextureData(img)
 end
 
 -- ============================================================================
+-- EDIT MODE DRAWING
+-- ============================================================================
+local function drawEditGrid()
+    -- Fill viewport area with top-down grid
+    local gridArea_W = VP_W
+    local gridArea_H = VP_H
+
+    -- Calculate cell size to fit the map in the viewport
+    local cellW = math_floor(gridArea_W / mapW)
+    local cellH = math_floor(gridArea_H / mapH)
+    local cellSize = math_min(cellW, cellH)
+    if cellSize < 2 then cellSize = 2 end
+
+    -- Center the grid in viewport
+    local totalW = cellSize * mapW
+    local totalH = cellSize * mapH
+    local ox = VP_X + math_floor((gridArea_W - totalW) / 2)
+    local oy = VP_Y + math_floor((gridArea_H - totalH) / 2)
+
+    -- Background
+    gfx.rect(VP_X, VP_Y, VP_W, VP_H, 0)
+
+    -- Draw each cell
+    for y = 1, mapH do
+        for x = 1, mapW do
+            local tile = getTile(x, y)
+            local col = TILE_COLORS[tile] or 0
+            local px = ox + (x - 1) * cellSize
+            local py = oy + (y - 1) * cellSize
+            gfx.rect(px, py, cellSize, cellSize, col)
+
+            -- Draw grid lines (dark gray border between cells)
+            gfx.setColor(8)
+            love.graphics.rectangle("line", px, py, cellSize, cellSize)
+        end
+    end
+
+    -- Draw player start marker (always visible, even if tile is overwritten)
+    local psx = ox + (playerStartX - 1) * cellSize
+    local psy = oy + (playerStartY - 1) * cellSize
+    -- Small "P" marker
+    if cellSize >= 6 then
+        gfx.print("P", psx + 1, psy, 15)
+    else
+        gfx.setColor(15)
+        love.graphics.rectangle("fill", psx + 1, psy + 1, cellSize - 2, cellSize - 2)
+    end
+
+    -- Draw cursor highlight (red border)
+    local cx = ox + (cursorX - 1) * cellSize
+    local cy = oy + (cursorY - 1) * cellSize
+    gfx.setColor(12) -- red
+    love.graphics.setLineWidth(1)
+    love.graphics.rectangle("line", cx, cy, cellSize, cellSize)
+    love.graphics.rectangle("line", cx + 1, cy + 1, cellSize - 2, cellSize - 2)
+
+    -- Viewport border
+    gfx.rectLine(VP_X, VP_Y, VP_W, VP_H, 8)
+end
+
+local function drawEditPanel()
+    drawBevel(RPANEL_X, RPANEL_Y, RPANEL_W, RPANEL_H)
+
+    local sx = RPANEL_X + 3
+    local sy = RPANEL_Y + 3
+
+    -- Title
+    gfx.print("EDIT MODE", sx, sy, 0)
+    sy = sy + 12
+
+    -- Cursor position
+    gfx.print("CUR:" .. cursorX .. "," .. cursorY, sx, sy, 7)
+    sy = sy + 10
+
+    -- Current tile under cursor
+    local curTile = getTile(cursorX, cursorY)
+    gfx.print("TILE:" .. (TILE_NAMES[curTile] or "?"), sx, sy, 7)
+    sy = sy + 14
+
+    -- Brush
+    gfx.print("BRUSH:", sx, sy, 15)
+    sy = sy + 10
+    local brushCol = TILE_COLORS[brushType] or 0
+    gfx.rect(sx, sy, 8, 8, brushCol)
+    gfx.rectLine(sx, sy, 8, 8, 15)
+    gfx.print(TILE_NAMES[brushType] or "?", sx + 11, sy, 14)
+    sy = sy + 14
+
+    -- Legend
+    gfx.print("LEGEND:", sx, sy, 15)
+    sy = sy + 10
+    for _, tileType in ipairs(BRUSH_ORDER) do
+        local col = TILE_COLORS[tileType]
+        gfx.rect(sx, sy, 6, 6, col)
+        gfx.rectLine(sx, sy, 6, 6, 8)
+        gfx.print(TILE_NAMES[tileType], sx + 9, sy, 7)
+        sy = sy + 9
+    end
+
+    sy = sy + 4
+
+    -- Controls help
+    gfx.print("A:PAINT", sx, sy, 8)
+    sy = sy + 9
+    gfx.print("B:BRUSH", sx, sy, 8)
+    sy = sy + 9
+    gfx.print("F1:PLAY", sx, sy, 8)
+end
+
+-- ============================================================================
 -- CART INTERFACE
 -- ============================================================================
 function cart.init(console)
@@ -537,26 +772,33 @@ function cart.init(console)
     zBuffer = {}
     for i = 0, VP_W - 1 do zBuffer[i] = MAX_DIST end
 
-    -- Load map
-    mapW = DEFAULT_MAP.width
-    mapH = DEFAULT_MAP.height
-    map = {}
-    for i, v in ipairs(DEFAULT_MAP.tiles) do
-        map[i] = v
+    -- Default player start
+    playerStartX = 2
+    playerStartY = 2
+
+    -- Try loading saved map, fall back to default
+    if not loadMapFromFile() then
+        loadMapDefault()
     end
 
     -- Player start (1-based world coords, facing east)
     player = {
-        x     = 2.5,
-        y     = 2.5,
-        angle = 0,  -- facing east (0 = right = +X)
+        x     = playerStartX + 0.5,
+        y     = playerStartY + 0.5,
+        angle = 0,
     }
+
+    -- Edit mode state
+    mode = "play"
+    cursorX = 1
+    cursorY = 1
+    brushType = TILE_WALL
 
     -- Message log
     msgLog = {}
     addLog("RAYCAST DUNGEON")
     addLog("ARROWS: MOVE/TURN")
-    addLog("A: INTERACT")
+    addLog("F1: EDIT MODE")
 end
 
 function cart.reset(console)
@@ -564,7 +806,12 @@ function cart.reset(console)
 end
 
 function cart.update(dt, console)
-    -- Smooth movement via held keys
+    if mode == "edit" then
+        -- No continuous update needed in edit mode
+        return
+    end
+
+    -- PLAY MODE: smooth movement via held keys
     local moved = false
 
     if input.held.LEFT then
@@ -629,6 +876,47 @@ end
 function cart.input(action, pressed, console)
     if not pressed then return end
 
+    if mode == "edit" then
+        -- Edit mode controls via mapped actions
+        if action == "UP" then
+            cursorY = math_max(1, cursorY - 1)
+        elseif action == "DOWN" then
+            cursorY = math_min(mapH, cursorY + 1)
+        elseif action == "LEFT" then
+            cursorX = math_max(1, cursorX - 1)
+        elseif action == "RIGHT" then
+            cursorX = math_min(mapW, cursorX + 1)
+        elseif action == "A" then
+            -- Paint tile
+            if brushType == TILE_START then
+                -- Remove previous START tile
+                for y = 1, mapH do
+                    for x = 1, mapW do
+                        if getTile(x, y) == TILE_START then
+                            setTile(x, y, TILE_EMPTY)
+                        end
+                    end
+                end
+                playerStartX = cursorX
+                playerStartY = cursorY
+            end
+            setTile(cursorX, cursorY, brushType)
+            addLog("PLACED " .. (TILE_NAMES[brushType] or "?") .. " @" .. cursorX .. "," .. cursorY)
+        elseif action == "B" then
+            -- Cycle brush
+            local idx = 1
+            for i, bt in ipairs(BRUSH_ORDER) do
+                if bt == brushType then idx = i; break end
+            end
+            idx = idx + 1
+            if idx > #BRUSH_ORDER then idx = 1 end
+            brushType = BRUSH_ORDER[idx]
+            addLog("BRUSH: " .. (TILE_NAMES[brushType] or "?"))
+        end
+        return
+    end
+
+    -- PLAY MODE
     if action == "A" then
         -- Interact: check front cell
         local dx = math_cos(player.angle)
@@ -644,7 +932,53 @@ function cart.input(action, pressed, console)
     end
 end
 
+function cart.keypressed(key)
+    if key == "f1" then
+        if mode == "play" then
+            mode = "edit"
+            cursorX = clamp(math_floor(player.x), 1, mapW)
+            cursorY = clamp(math_floor(player.y), 1, mapH)
+            addLog("ENTERED EDIT MODE")
+        else
+            mode = "play"
+            applyPlayerStart()
+            addLog("ENTERED PLAY MODE")
+        end
+        return
+    end
+
+    if mode == "edit" then
+        if key == "r" then
+            -- Clear tile at cursor (set to empty)
+            setTile(cursorX, cursorY, TILE_EMPTY)
+            addLog("CLEARED @" .. cursorX .. "," .. cursorY)
+        elseif key == "s" then
+            saveMap()
+        elseif key == "l" then
+            if loadMapFromFile() then
+                addLog("MAP LOADED!")
+            else
+                addLog("NO SAVED MAP")
+            end
+        elseif key == "p" then
+            -- Test play: switch to play mode at player start
+            mode = "play"
+            applyPlayerStart()
+            addLog("TEST PLAY")
+        end
+    end
+end
+
 function cart.draw(console)
+    if mode == "edit" then
+        -- Edit mode: top-down grid + panel
+        drawEditGrid()
+        drawEditPanel()
+        drawMessageBox()
+        return
+    end
+
+    -- PLAY MODE
     -- Viewport
     drawViewport()
 
