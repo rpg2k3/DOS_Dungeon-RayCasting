@@ -1,0 +1,6 @@
+dungeons/
+*.log
+*.love
+build/
+.DS_Store
+Thumbs.db
