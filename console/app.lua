@@ -223,22 +223,54 @@ local function drawMenu()
     local lw = bw - 8
     local lh = bh - 38
 
-    local items = {}
     local count = carts.count()
-    for i = 1, count do
-        local c = carts.get(i)
-        items[i] = {
-            text = c.title or "???",
-            sub  = c.author and ("BY " .. c.author) or "",
-        }
+
+    if count == 0 then
+        -- Empty state: show diagnostics
+        theme.bevelRect(gfx, lx, ly, lw, lh, false)
+        gfx.rect(lx + 2, ly + 2, lw - 4, lh - 4, theme.C.listBg)
+
+        local report = carts.report
+        local dy = ly + 4
+        gfx.print("NO CARTS FOUND!", lx + 4, dy, 4)
+        dy = dy + 12
+        gfx.print("Folder exists: " .. (report.folderExists and "YES" or "NO"), lx + 4, dy, theme.C.winText)
+        dy = dy + 10
+        gfx.print("Files in /carts: " .. #report.items, lx + 4, dy, theme.C.winText)
+        dy = dy + 10
+        gfx.print("Modules tried: " .. #report.attempted, lx + 4, dy, theme.C.winText)
+        dy = dy + 10
+        gfx.print("Errors: " .. #report.errors, lx + 4, dy, #report.errors > 0 and 4 or theme.C.winText)
+        if #report.errors > 0 then
+            dy = dy + 12
+            local firstErr = report.errors[1]
+            local errText = firstErr.module .. ":"
+            gfx.print(errText, lx + 4, dy, 4)
+            dy = dy + 10
+            -- Truncate long error messages to fit the listbox
+            local errMsg = firstErr.err
+            if #errMsg > 40 then errMsg = errMsg:sub(1, 37) .. "..." end
+            gfx.print(errMsg, lx + 4, dy, 12)
+        end
+        dy = dy + 14
+        gfx.print("Check console output.", lx + 4, dy, theme.C.disabled)
+    else
+        local items = {}
+        for i = 1, count do
+            local c = carts.get(i)
+            items[i] = {
+                text = c.title or "???",
+                sub  = c.author and ("BY " .. c.author) or "",
+            }
+        end
+        theme.listbox(gfx, lx, ly, lw, lh, items, menuSel, 20)
     end
-    theme.listbox(gfx, lx, ly, lw, lh, items, menuSel, 20)
 
     -- launch button
     local btnW, btnH = 80, 16
     local btnX = bx + math.floor((bw - btnW) / 2)
     local btnY = by + bh - btnH - 2
-    theme.button(gfx, btnX, btnY, btnW, btnH, "LAUNCH [A]")
+    theme.button(gfx, btnX, btnY, btnW, btnH, count > 0 and "LAUNCH [A]" or "NO CARTS")
 
     -- settings hint (below launch button)
     gfx.print("[B] SETTINGS", bx + 4, btnY + btnH + 2, theme.C.disabled)
