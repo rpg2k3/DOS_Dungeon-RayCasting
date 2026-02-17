@@ -22,14 +22,17 @@ local padMap = {
     dpright       = "RIGHT",
     a             = "A",
     b             = "B",
+    x             = "X",
+    y             = "Y",
     start         = "START",
-    back          = "RESET",
+    back          = "SELECT",
+    leftshoulder  = "L1",
     rightshoulder = "DEBUG",
 }
 
 local GAMEPLAY = {"LEFT", "RIGHT", "UP", "DOWN", "A", "B"}
-local META     = {"START", "RESET", "DEBUG"}
-local ALL      = {"LEFT", "RIGHT", "UP", "DOWN", "A", "B", "START", "RESET", "DEBUG"}
+local META     = {"START", "RESET", "DEBUG", "SELECT", "X", "Y", "L1"}
+local ALL      = {"LEFT", "RIGHT", "UP", "DOWN", "A", "B", "START", "RESET", "DEBUG", "SELECT", "X", "Y", "L1"}
 
 input.held        = {}
 input.justPressed = {}

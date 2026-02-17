@@ -1,10 +1,12 @@
 local gfx     = require("console.gfx")
 local input   = require("console.input")
 local sfx     = require("console.sfx")
+local music   = require("console.music")
 local storage = require("console.storage")
 local assets  = require("console.assets")
 local carts   = require("console.carts")
 local theme   = require("console.theme")
+local tracker = require("console.tracker")
 
 local app = {}
 
@@ -12,11 +14,20 @@ local app = {}
 local console = {
     gfx     = gfx,
     sfx     = sfx,
+    music   = music,
     storage = storage,
     input   = input,
     assets  = assets,
+    tracker = tracker,
     time    = { dt = 0, frame = 0, total = 0 },
     state   = "BOOT",
+    texturesEnabled = true,
+    brightness = 5,
+    renderScale = "CRISP",  -- "CRISP" or "LOW"
+    fovDeg = 60,            -- 45-90
+    fogStrength = 1.0,      -- 0.0-2.0
+    torchRadius = 5.0,      -- 1-10
+    torchStrength = 1.0,    -- 0.0-2.0
 }
 
 local state        = "BOOT"
@@ -26,7 +37,60 @@ local menuSel      = 1
 local currentCart   = nil
 local debugOn      = false
 local crtOn        = false
-local pauseSel     = 1   -- 1=Resume, 2=Reset, 3=Menu
+local musicOn      = false
+local pauseSel     = 1   -- 1=Resume, 2=Reset, 3=Settings, 4=Menu
+local settingsSel  = 1   -- selected row in settings dialog
+local settingsFrom = nil -- "MENU" or "PAUSED", so we return to the right place
+
+-- Settings defaults
+local SETTINGS_DEFAULTS = {
+    crt           = false,
+    textures      = true,
+    brightness    = 5,       -- 1-10 scale
+    renderScale   = "CRISP", -- "CRISP" or "LOW"
+    fovDeg        = 60,      -- 45-90
+    fogStrength   = 10,      -- 0-20 (displayed as 0.0-2.0)
+    torchRadius   = 50,      -- 10-100 (displayed as 1.0-10.0)
+    torchStrength = 10,      -- 0-20 (displayed as 0.0-2.0)
+}
+
+-- Load settings from storage (or defaults)
+local function loadSettings()
+    crtOn = storage.get("set_crt", SETTINGS_DEFAULTS.crt)
+    console.texturesEnabled = storage.get("set_textures", SETTINGS_DEFAULTS.textures)
+    console.brightness = storage.get("set_brightness", SETTINGS_DEFAULTS.brightness)
+    console.renderScale = storage.get("set_renderscale", SETTINGS_DEFAULTS.renderScale)
+    console.fovDeg = storage.get("set_fov", SETTINGS_DEFAULTS.fovDeg)
+    console.fogStrength = storage.get("set_fog", SETTINGS_DEFAULTS.fogStrength) / 10
+    console.torchRadius = storage.get("set_torchrad", SETTINGS_DEFAULTS.torchRadius) / 10
+    console.torchStrength = storage.get("set_torchstr", SETTINGS_DEFAULTS.torchStrength) / 10
+end
+
+-- Save current settings to storage
+local function saveSettings()
+    storage.set("set_crt", crtOn)
+    storage.set("set_textures", console.texturesEnabled)
+    storage.set("set_brightness", console.brightness)
+    storage.set("set_renderscale", console.renderScale)
+    storage.set("set_fov", console.fovDeg)
+    storage.set("set_fog", math.floor(console.fogStrength * 10 + 0.5))
+    storage.set("set_torchrad", math.floor(console.torchRadius * 10 + 0.5))
+    storage.set("set_torchstr", math.floor(console.torchStrength * 10 + 0.5))
+    storage.flush()
+end
+
+-- Reset all settings to defaults
+local function resetSettings()
+    crtOn = SETTINGS_DEFAULTS.crt
+    console.texturesEnabled = SETTINGS_DEFAULTS.textures
+    console.brightness = SETTINGS_DEFAULTS.brightness
+    console.renderScale = SETTINGS_DEFAULTS.renderScale
+    console.fovDeg = SETTINGS_DEFAULTS.fovDeg
+    console.fogStrength = SETTINGS_DEFAULTS.fogStrength / 10
+    console.torchRadius = SETTINGS_DEFAULTS.torchRadius / 10
+    console.torchStrength = SETTINGS_DEFAULTS.torchStrength / 10
+    saveSettings()
+end
 
 ----------------------------------------------------------------
 -- helpers
@@ -127,6 +191,13 @@ local function updateMenu()
             switchState("RUNNING")
         end
     end
+    -- B opens settings from menu
+    if input.justPressed.B then
+        sfx.play("ui_select")
+        settingsSel = 2  -- skip header row
+        settingsFrom = "MENU"
+        switchState("SETTINGS")
+    end
 end
 
 local function drawMenu()
@@ -169,6 +240,9 @@ local function drawMenu()
     local btnY = by + bh - btnH - 2
     theme.button(gfx, btnX, btnY, btnW, btnH, "LAUNCH [A]")
 
+    -- settings hint (below launch button)
+    gfx.print("[B] SETTINGS", bx + 4, btnY + btnH + 2, theme.C.disabled)
+
     -- taskbar
     theme.taskbar(gfx, H - TASKBAR_H, W, TASKBAR_H, "DUNGEON CONSOLE", "V1.0")
 end
@@ -179,6 +253,15 @@ end
 local prevHeldSnap = {}
 
 local function updateRunning(dt)
+    -- Tracker overlay takes priority when active
+    if tracker.isActive() then
+        tracker.update(dt)
+        return
+    end
+    -- Skip pause trigger for one frame after tracker closes (escape key overlap)
+    if tracker.wasJustClosed() then
+        return
+    end
     -- check pause
     if input.justPressed.START then
         sfx.play("ui_select")
@@ -186,12 +269,8 @@ local function updateRunning(dt)
         switchState("PAUSED")
         return
     end
-    -- debug toggle (CRT toggle when not in cart editor)
-    if input.justPressed.DEBUG then
-        debugOn = not debugOn
-    end
     -- fire input events to cart
-    for _, a in ipairs({"LEFT","RIGHT","UP","DOWN","A","B"}) do
+    for _, a in ipairs({"LEFT","RIGHT","UP","DOWN","A","B","SELECT","X","Y","L1"}) do
         if input.justPressed[a] then fireCartInput(a, true) end
         if input.justReleased[a] then fireCartInput(a, false) end
     end
@@ -205,12 +284,16 @@ local function drawRunning()
     if currentCart and currentCart.draw then
         currentCart.draw(console)
     end
+    -- Draw tracker overlay on top if active
+    if tracker.isActive() then
+        tracker.draw()
+    end
 end
 
 ----------------------------------------------------------------
 -- State: PAUSED  (Win3.1 modal dialog over game)
 ----------------------------------------------------------------
-local PAUSE_ITEMS = {"RESUME", "RESET", "QUIT TO MENU"}
+local PAUSE_ITEMS = {"RESUME", "RESET", "SETTINGS", "QUIT TO MENU"}
 
 local function updatePaused()
     -- navigate buttons
@@ -232,19 +315,18 @@ local function updatePaused()
             resetCart()
             switchState("RUNNING")
         elseif pauseSel == 3 then
+            settingsSel = 2  -- skip header row
+            settingsFrom = "PAUSED"
+            switchState("SETTINGS")
+        elseif pauseSel == 4 then
             currentCart = nil
             switchState("MENU")
         end
     end
-    -- quick resume
-    if input.justPressed.START then
+    -- quick resume (START or B = go back)
+    if input.justPressed.START or input.justPressed.B then
         sfx.play("ui_select")
         switchState("RUNNING")
-    end
-    if input.justPressed.B then
-        sfx.play("ui_select")
-        currentCart = nil
-        switchState("MENU")
     end
 end
 
@@ -257,7 +339,7 @@ local function drawPaused()
     love.graphics.rectangle("fill", 0, 0, gfx.VIRT_W, gfx.VIRT_H)
 
     -- centered Win3.1 dialog window
-    local pw, ph = 160, 90
+    local pw, ph = 160, 110
     local px = math.floor((gfx.VIRT_W - pw) / 2)
     local py = math.floor((gfx.VIRT_H - ph) / 2)
 
@@ -273,7 +355,224 @@ local function drawPaused()
     end
 
     -- hint
-    gfx.print("START:PAUSE  B:MENU", px + 10, py + ph - 14, theme.C.disabled)
+    gfx.print("START/B:RESUME  A:SELECT", px + 4, py + ph - 14, theme.C.disabled)
+end
+
+----------------------------------------------------------------
+-- State: SETTINGS  (Win3.1 dialog with toggle/slider items)
+----------------------------------------------------------------
+-- Settings rows: { label, type, get, set }
+-- type = "toggle", "slider", "action", or "header"
+local SETTINGS_ROWS = {
+    { label = "-- DISPLAY --",   type = "header" },
+    { label = "CRT EFFECT",      type = "toggle",  key = "crt" },
+    { label = "TEXTURES",        type = "toggle",  key = "textures" },
+    { label = "BRIGHTNESS",      type = "slider",  key = "brightness", min = 1, max = 10, step = 1 },
+    { label = "RENDER SCALE",    type = "toggle",  key = "renderScale" },
+    { label = "FOV",             type = "slider",  key = "fov", min = 45, max = 90, step = 5 },
+    { label = "-- LIGHTING --",  type = "header" },
+    { label = "FOG",             type = "slider",  key = "fog", min = 0, max = 20, step = 1 },
+    { label = "TORCH RADIUS",   type = "slider",  key = "torchRadius", min = 10, max = 100, step = 5 },
+    { label = "TORCH POWER",    type = "slider",  key = "torchStrength", min = 0, max = 20, step = 1 },
+    { label = "DEFAULTS",        type = "action" },
+    { label = "BACK",            type = "action" },
+}
+
+local function getSettingVal(idx)
+    local row = SETTINGS_ROWS[idx]
+    if not row or not row.key then return nil end
+    local k = row.key
+    if k == "crt" then return crtOn
+    elseif k == "textures" then return console.texturesEnabled
+    elseif k == "brightness" then return console.brightness
+    elseif k == "renderScale" then return console.renderScale == "LOW"
+    elseif k == "fov" then return console.fovDeg
+    elseif k == "fog" then return math.floor(console.fogStrength * 10 + 0.5)
+    elseif k == "torchRadius" then return math.floor(console.torchRadius * 10 + 0.5)
+    elseif k == "torchStrength" then return math.floor(console.torchStrength * 10 + 0.5)
+    end
+    return nil
+end
+
+local function setSettingVal(idx, val)
+    local row = SETTINGS_ROWS[idx]
+    if not row or not row.key then return end
+    local k = row.key
+    if k == "crt" then crtOn = val
+    elseif k == "textures" then console.texturesEnabled = val
+    elseif k == "brightness" then console.brightness = math.max(1, math.min(10, val))
+    elseif k == "renderScale" then console.renderScale = val and "LOW" or "CRISP"
+    elseif k == "fov" then console.fovDeg = math.max(45, math.min(90, val))
+    elseif k == "fog" then console.fogStrength = math.max(0, math.min(20, val)) / 10
+    elseif k == "torchRadius" then console.torchRadius = math.max(10, math.min(100, val)) / 10
+    elseif k == "torchStrength" then console.torchStrength = math.max(0, math.min(20, val)) / 10
+    end
+end
+
+-- Skip header rows when navigating settings
+local function settingsNavUp()
+    repeat
+        settingsSel = settingsSel - 1
+        if settingsSel < 1 then settingsSel = #SETTINGS_ROWS end
+    until SETTINGS_ROWS[settingsSel].type ~= "header"
+end
+
+local function settingsNavDown()
+    repeat
+        settingsSel = settingsSel + 1
+        if settingsSel > #SETTINGS_ROWS then settingsSel = 1 end
+    until SETTINGS_ROWS[settingsSel].type ~= "header"
+end
+
+local function updateSettings()
+    -- navigate
+    if input.justPressed.UP then
+        settingsNavUp()
+        sfx.play("ui_move")
+    end
+    if input.justPressed.DOWN then
+        settingsNavDown()
+        sfx.play("ui_move")
+    end
+
+    local row = SETTINGS_ROWS[settingsSel]
+
+    -- left/right for sliders
+    if row.type == "slider" then
+        local step = row.step or 1
+        if input.justPressed.LEFT then
+            setSettingVal(settingsSel, getSettingVal(settingsSel) - step)
+            sfx.play("ui_move")
+        end
+        if input.justPressed.RIGHT then
+            setSettingVal(settingsSel, getSettingVal(settingsSel) + step)
+            sfx.play("ui_move")
+        end
+    end
+
+    -- A to toggle or activate
+    if input.justPressed.A then
+        sfx.play("ui_select")
+        if row.type == "toggle" then
+            setSettingVal(settingsSel, not getSettingVal(settingsSel))
+        elseif row.type == "action" then
+            if row.label == "DEFAULTS" then
+                resetSettings()
+                -- skip to first non-header row
+                settingsSel = 1
+                if SETTINGS_ROWS[settingsSel].type == "header" then settingsNavDown() end
+            elseif row.label == "BACK" then
+                saveSettings()
+                switchState(settingsFrom or "MENU")
+            end
+        end
+    end
+
+    -- B / START to go back
+    if input.justPressed.B or input.justPressed.START then
+        sfx.play("ui_select")
+        saveSettings()
+        switchState(settingsFrom or "MENU")
+    end
+end
+
+-- Format a slider value for display
+local function formatSliderVal(row, val)
+    local k = row.key
+    if k == "fog" or k == "torchStrength" then
+        return string.format("%.1f", val / 10)
+    elseif k == "torchRadius" then
+        return string.format("%.1f", val / 10)
+    elseif k == "fov" then
+        return tostring(val)
+    end
+    return tostring(val)
+end
+
+local function drawSettings()
+    -- draw appropriate background
+    if settingsFrom == "PAUSED" then
+        drawRunning()
+        gfx.setColorRGBA(0, 0, 0, 0.55)
+        love.graphics.rectangle("fill", 0, 0, gfx.VIRT_W, gfx.VIRT_H)
+    else
+        local W, H = gfx.VIRT_W, gfx.VIRT_H
+        theme.desktop(gfx, W, H - 14)
+        theme.taskbar(gfx, H - 14, W, 14, "DUNGEON CONSOLE", "V1.0")
+    end
+
+    -- centered settings window (taller to fit all rows)
+    local rowH = 13
+    local numRows = #SETTINGS_ROWS
+    local pw, ph = 210, 24 + numRows * rowH + 14
+    local px = math.floor((gfx.VIRT_W - pw) / 2)
+    local py = math.floor((gfx.VIRT_H - ph) / 2)
+
+    local bx, by, bw, bh = theme.window(gfx, px, py, pw, ph, "SETTINGS")
+
+    -- draw each row
+    for i, row in ipairs(SETTINGS_ROWS) do
+        local ry = by + 2 + (i - 1) * rowH
+        local sel = (i == settingsSel)
+
+        if row.type == "header" then
+            -- Section header (not selectable)
+            gfx.print(row.label, bx + 6, ry + 2, 14)
+        elseif row.type == "toggle" then
+            -- highlight bar
+            if sel then
+                gfx.rect(bx + 2, ry, bw - 4, rowH - 1, 1)
+            end
+            local textCol = sel and 15 or theme.C.winText
+            local val = getSettingVal(i)
+            gfx.print(row.label, bx + 6, ry + 2, textCol)
+            -- checkbox
+            local cbx = bx + bw - 44
+            gfx.rect(cbx, ry + 2, 8, 8, 15)
+            gfx.rectLine(cbx, ry + 2, 8, 8, 0)
+            if val then
+                gfx.print("X", cbx + 1, ry + 2, 0)
+            end
+            -- Label for renderScale toggle
+            local label
+            if row.key == "renderScale" then
+                label = val and "LOW" or "CRISP"
+            else
+                label = val and "ON" or "OFF"
+            end
+            gfx.print(label, cbx + 12, ry + 2, textCol)
+        elseif row.type == "slider" then
+            if sel then
+                gfx.rect(bx + 2, ry, bw - 4, rowH - 1, 1)
+            end
+            local textCol = sel and 15 or theme.C.winText
+            local val = getSettingVal(i)
+            gfx.print(row.label, bx + 6, ry + 2, textCol)
+            -- slider bar
+            local sbx = bx + bw - 80
+            local sbw = 50
+            gfx.rect(sbx, ry + 4, sbw, 4, 8)
+            gfx.rectLine(sbx, ry + 4, sbw, 4, 0)
+            -- filled portion
+            local frac = (val - row.min) / (row.max - row.min)
+            local fillW = math.floor(sbw * frac)
+            if fillW > 0 then
+                gfx.rect(sbx, ry + 4, fillW, 4, 9)
+            end
+            -- value text
+            gfx.print(formatSliderVal(row, val), sbx + sbw + 4, ry + 2, textCol)
+        elseif row.type == "action" then
+            if sel then
+                gfx.rect(bx + 2, ry, bw - 4, rowH - 1, 1)
+            end
+            local lw = gfx.textWidth(row.label)
+            local lx = bx + math.floor((bw - lw) / 2)
+            gfx.print(row.label, lx, ry + 2, sel and 14 or theme.C.disabled)
+        end
+    end
+
+    -- hint at bottom
+    gfx.print("A:TOGGLE  LR:SLIDER  B:BACK", px + 4, py + ph - 12, theme.C.disabled)
 end
 
 ----------------------------------------------------------------
@@ -282,7 +581,7 @@ end
 local function drawDebug()
     if not debugOn then return end
     local dw = 130
-    local dh = 62
+    local dh = 72
     local dx = gfx.VIRT_W - dw - 2
     local dy = 2
     gfx.rect(dx, dy, dw, dh, 0)
@@ -293,6 +592,7 @@ local function drawDebug()
     gfx.print("INP: " .. table.concat(held, ","), dx + 4, dy + 24, 10)
     gfx.print("ST: " .. state, dx + 4, dy + 34, 10)
     gfx.print("CRT: " .. (crtOn and "ON" or "OFF"), dx + 4, dy + 44, crtOn and 10 or 12)
+    gfx.print("MUS: " .. (musicOn and "ON" or "OFF"), dx + 4, dy + 54, musicOn and 10 or 12)
 end
 
 ----------------------------------------------------------------
@@ -300,7 +600,7 @@ end
 ----------------------------------------------------------------
 local function drawCursor()
     -- only show cursor on menu/pause states
-    if state ~= "MENU" and state ~= "PAUSED" and state ~= "BOOT" then return end
+    if state ~= "MENU" and state ~= "PAUSED" and state ~= "BOOT" and state ~= "SETTINGS" then return end
 
     local cursor = theme.getCursor()
     if not cursor then return end
@@ -325,9 +625,12 @@ function app.init()
     gfx.init()
     input.init()
     sfx.init()
+    music.init()
     storage.init()
+    loadSettings()
     assets.init()
     carts.init()
+    tracker.init(console)
     -- hide system cursor
     love.mouse.setVisible(false)
     switchState("BOOT")
@@ -340,35 +643,47 @@ function app.update(dt)
 
     local limit = (state == "RUNNING")
     input.update(limit)
+    music.update(dt)
 
-    -- CRT toggle: DEBUG key when NOT in RUNNING state (where it goes to cart)
-    if state ~= "RUNNING" and input.justPressed.DEBUG then
-        crtOn = not crtOn
+    -- Debug overlay toggle (global, any state except SETTINGS)
+    if state ~= "SETTINGS" and input.justPressed.DEBUG then
+        debugOn = not debugOn
     end
 
-    if     state == "BOOT"    then updateBoot(dt)
-    elseif state == "MENU"    then updateMenu()
-    elseif state == "RUNNING" then updateRunning(dt)
-    elseif state == "PAUSED"  then updatePaused()
+    if     state == "BOOT"     then updateBoot(dt)
+    elseif state == "MENU"     then updateMenu()
+    elseif state == "RUNNING"  then updateRunning(dt)
+    elseif state == "PAUSED"   then updatePaused()
+    elseif state == "SETTINGS" then updateSettings()
     end
 end
 
 function app.draw()
     gfx.beginDraw()
 
-    if     state == "BOOT"    then drawBoot()
-    elseif state == "MENU"    then drawMenu()
-    elseif state == "RUNNING" then drawRunning()
-    elseif state == "PAUSED"  then drawPaused()
+    if     state == "BOOT"     then drawBoot()
+    elseif state == "MENU"     then drawMenu()
+    elseif state == "RUNNING"  then drawRunning()
+    elseif state == "PAUSED"   then drawPaused()
+    elseif state == "SETTINGS" then drawSettings()
     end
 
     drawCursor()
     drawDebug()
-    gfx.endDraw(crtOn)
+    gfx.endDraw(crtOn, console.brightness)
 end
 
 function app.keypressed(key)
     input.keypressed(key)
+    -- Music toggle (global, any state) — but NOT when tracker is active
+    if key == "m" and not tracker.isActive() then
+        musicOn = music.toggle()
+    end
+    -- Tracker captures all keys when active
+    if state == "RUNNING" and tracker.isActive() then
+        tracker.keypressed(key)
+        return
+    end
     -- Forward raw keypresses to cart (for edit mode keys like F1, S, L, R, P)
     if state == "RUNNING" and currentCart and currentCart.keypressed then
         currentCart.keypressed(key)

@@ -168,6 +168,7 @@ local crtShader
 local CRT_GLSL = [[
 extern vec2 inputSize;   // virtual canvas pixel dimensions
 extern float time;       // elapsed seconds (for noise)
+extern float brightness; // 0.0-2.0 brightness multiplier
 
 // barrel distortion strength
 const float BARREL = 0.08;
@@ -201,6 +202,9 @@ vec4 effect(vec4 color, Image tex, vec2 texCoord, vec2 pixCoord) {
     float g = Texel(tex, uv).g;
     float b = Texel(tex, vec2(uv.x - CHROMA, uv.y)).b;
     vec3 col = vec3(r, g, b);
+
+    // apply brightness
+    col *= brightness;
 
     // scanlines (darken every other virtual-pixel row)
     float scanY = uv.y * inputSize.y;
@@ -257,15 +261,25 @@ function gfx.beginDraw()
     love.graphics.setLineWidth(1)
 end
 
-function gfx.endDraw(crtEnabled)
+function gfx.endDraw(crtEnabled, brightnessLevel)
     love.graphics.setCanvas()
     love.graphics.clear(0.05, 0.05, 0.05, 1)
-    love.graphics.setColor(1, 1, 1, 1)
+
+    -- Convert brightness 1-10 scale to multiplier (5 = 1.0 normal)
+    local bMul = 1.0
+    if brightnessLevel then
+        bMul = brightnessLevel / 5.0  -- 1=0.2, 5=1.0, 10=2.0
+    end
 
     if crtEnabled and crtShader then
         crtShader:send("inputSize", {gfx.VIRT_W, gfx.VIRT_H})
         crtShader:send("time", love.timer.getTime())
+        crtShader:send("brightness", bMul)
         love.graphics.setShader(crtShader)
+        love.graphics.setColor(1, 1, 1, 1)
+    else
+        -- Apply brightness as vertex color tint when no CRT shader
+        love.graphics.setColor(bMul, bMul, bMul, 1)
     end
 
     love.graphics.draw(gfx.canvas, gfx.offsetX, gfx.offsetY, 0, gfx.scale, gfx.scale)

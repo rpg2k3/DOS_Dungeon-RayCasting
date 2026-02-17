@@ -4,6 +4,7 @@ assets.images = {}
 assets.categories = {
     walls = {},
     floor = {},
+    roof  = {},
     bg    = {},
 }
 
@@ -53,6 +54,7 @@ end
 function assets.init()
     assets.loadCategory("walls")
     assets.loadCategory("floor")
+    assets.loadCategory("roof")
     assets.loadCategory("bg")
 end
 
