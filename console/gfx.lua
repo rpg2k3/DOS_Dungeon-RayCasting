@@ -170,55 +170,40 @@ extern vec2 inputSize;   // virtual canvas pixel dimensions
 extern float time;       // elapsed seconds (for noise)
 extern float brightness; // 0.0-2.0 brightness multiplier
 
-// barrel distortion strength
-const float BARREL = 0.08;
-// chromatic aberration offset (in UV space)
-const float CHROMA = 0.0015;
-// scanline darkness
-const float SCANLINE = 0.18;
-// vignette strength
-const float VIGNETTE = 0.35;
-
 // simple pseudo-random
 float rand(vec2 co) {
     return fract(sin(dot(co, vec2(12.9898, 78.233))) * 43758.5453);
 }
 
-vec2 barrelDistort(vec2 uv) {
-    vec2 cc = uv - 0.5;
-    float r2 = dot(cc, cc);
-    return uv + cc * r2 * BARREL;
-}
-
 vec4 effect(vec4 color, Image tex, vec2 texCoord, vec2 pixCoord) {
-    vec2 uv = barrelDistort(texCoord);
+    // barrel distortion
+    vec2 cc = texCoord - 0.5;
+    float r2 = dot(cc, cc);
+    vec2 uv = texCoord + cc * r2 * 0.08;
 
     // discard pixels outside barrel-distorted area
     if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0)
         return vec4(0.0, 0.0, 0.0, 1.0);
 
-    // chromatic aberration: offset R and B channels slightly
-    float r = Texel(tex, vec2(uv.x + CHROMA, uv.y)).r;
+    // chromatic aberration
+    float r = Texel(tex, vec2(uv.x + 0.0015, uv.y)).r;
     float g = Texel(tex, uv).g;
-    float b = Texel(tex, vec2(uv.x - CHROMA, uv.y)).b;
+    float b = Texel(tex, vec2(uv.x - 0.0015, uv.y)).b;
     vec3 col = vec3(r, g, b);
 
-    // apply brightness
+    // brightness
     col *= brightness;
 
-    // scanlines (darken every other virtual-pixel row)
+    // scanlines
     float scanY = uv.y * inputSize.y;
-    float scanFactor = 1.0 - SCANLINE * step(0.5, fract(scanY * 0.5));
-    col *= scanFactor;
+    col *= 1.0 - 0.18 * step(0.5, fract(scanY * 0.5));
 
-    // vignette (darken edges)
+    // vignette
     vec2 vig = uv - 0.5;
-    float vigAmount = 1.0 - dot(vig, vig) * VIGNETTE * 4.0;
-    col *= clamp(vigAmount, 0.0, 1.0);
+    col *= clamp(1.0 - dot(vig, vig) * 1.4, 0.0, 1.0);
 
-    // subtle noise flicker
-    float noise = rand(uv + vec2(time, 0.0)) * 0.04 - 0.02;
-    col += noise;
+    // subtle noise
+    col += rand(uv + vec2(time, 0.0)) * 0.04 - 0.02;
 
     return vec4(clamp(col, 0.0, 1.0), 1.0) * color;
 }
@@ -226,10 +211,10 @@ vec4 effect(vec4 color, Image tex, vec2 texCoord, vec2 pixCoord) {
 
 local function buildCrtShader()
     local ok, shader = pcall(love.graphics.newShader, CRT_GLSL)
-    if ok then
-        return shader
+    if not ok then
+        return nil
     end
-    return nil
+    return shader
 end
 
 ----------------------------------------------------------------
@@ -272,11 +257,19 @@ function gfx.endDraw(crtEnabled, brightnessLevel)
     end
 
     if crtEnabled and crtShader then
-        crtShader:send("inputSize", {gfx.VIRT_W, gfx.VIRT_H})
-        crtShader:send("time", love.timer.getTime())
-        crtShader:send("brightness", bMul)
-        love.graphics.setShader(crtShader)
-        love.graphics.setColor(1, 1, 1, 1)
+        local sendOk = pcall(function()
+            crtShader:send("inputSize", {gfx.VIRT_W, gfx.VIRT_H})
+            crtShader:send("time", love.timer.getTime())
+            crtShader:send("brightness", bMul)
+        end)
+        if not sendOk then
+            -- Shader uniforms failed — disable CRT permanently for this session
+            crtShader = nil
+            love.graphics.setColor(bMul, bMul, bMul, 1)
+        else
+            love.graphics.setShader(crtShader)
+            love.graphics.setColor(1, 1, 1, 1)
+        end
     else
         -- Apply brightness as vertex color tint when no CRT shader
         love.graphics.setColor(bMul, bMul, bMul, 1)

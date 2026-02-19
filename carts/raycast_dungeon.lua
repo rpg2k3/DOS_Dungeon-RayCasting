@@ -6,6 +6,7 @@ local cart = {
     author      = "SYSTEM",
     description = "Classic raycasting 3D with textured walls, floor & ceiling.",
     id          = "raycast_dungeon",
+    handlesStart = true,  -- cart owns pause menu; ESC/START opens it, only menu quits
 }
 
 -- ============================================================================
@@ -32,18 +33,17 @@ local MAX_DIST  = 20
 local MOVE_SPEED = 3.0
 local ROT_SPEED  = 2.5
 
--- Lighting / Fog
-local AMBIENT       = 0.28
-local FOG_DIST      = 8.0
-local TORCH_RADIUS  = 5.0
-local TORCH_STRENGTH = 1.0
+-- Lighting / Fog (grouped to reduce local count)
+local LIGHTING = { AMBIENT = 0.28, FOG_DIST = 8.0, TORCH_RADIUS = 5.0, TORCH_STRENGTH = 1.0 }
 
--- Player stats
-local MOVE_COST     = 2     -- stamina per tile moved
-local MELEE_COST    = 12    -- stamina per melee attack (future)
-local RANGED_COST   = 8     -- stamina per ranged shot (future)
-local STAM_REGEN    = 15    -- stamina regen per second (when not attacking)
-local DEATH_DELAY   = 1.5   -- seconds before respawn after death
+-- Player stats (grouped to reduce local count)
+local PLAYER_CONST = {
+    MOVE_COST   = 2,      -- stamina per tile moved
+    MELEE_COST  = 12,     -- stamina per melee attack (future)
+    RANGED_COST = 8,      -- stamina per ranged shot (future)
+    STAM_REGEN  = 15,     -- stamina regen per second (when not attacking)
+    DEATH_DELAY = 1.5,    -- seconds before respawn after death
+}
 
 -- Tile types
 local TILE_EMPTY  = 0
@@ -74,8 +74,7 @@ local BRUSH_ORDER = { TILE_WALL, TILE_EMPTY, TILE_DOOR, TILE_STAIRS, TILE_START 
 -- ============================================================================
 -- STATE
 -- ============================================================================
-local gfx, assets, sfx, input
-local trackerRef  -- reference to console.tracker
+local gfx, assets, sfx, input, sprites
 local consoleRef  -- reference to console object (for live settings access)
 local texWall, texFloor, texCeil
 local texWallW, texWallH, texFloorW, texFloorH, texCeilW, texCeilH
@@ -114,21 +113,19 @@ local ceilMat       -- flat array [idx] = texture key string
 local texCatalog    -- built from assets at init
 local texByKey      -- { "walls/brick_wall" = {img=..., data=..., w=..., h=...} }
 
--- Editor material mode
-local editMode      -- 1=collision, 2=wall mat, 3=floor mat, 4=ceil mat
-local paletteSel    -- selected index in current palette list
-local paletteScroll -- scroll offset for palette list
-
 -- Edit mode state
 local mode          -- "play" or "edit"
-local cursorX, cursorY
-local brushType
 local playerStartX, playerStartY
-local showHelp      -- help overlay visible in edit mode
-local helpScroll    -- scroll offset for help text
 
 -- Torch state
 local torchEnabled  -- toggle with F key in play mode
+
+-- NPC billboard test
+local npcs          -- array of { x, y, img, pivotY }
+
+-- Weapon overlay state
+local wpnOverlay    -- { weapon = {frames}, hand = {frames} } per weapon id
+local wpnBobTimer = 0  -- walk bob accumulator
 
 -- SFX state
 local stepTimer     -- accumulator for footstep sound throttle
@@ -137,15 +134,33 @@ local STEP_INTERVAL = 0.25  -- seconds between step sounds
 -- Tutorial state: reduce HUD text after first movement
 local hasMovedOnce
 
+-- Run frame counter: avoid first-frame SELECT (e.g. from menu) toggling edit mode
+local runFrames = 0
+
+-- Tool registry + cart state for tools (require deferred to init so cart parses even if tools fail to load)
+local toolRegistry = nil
+local cartState = { tools = {} }
+local activeToolId = nil  -- id of currently active tool (or nil)
+
+-- Pause menu (inside cart; ESC/START opens, only "Quit to Program Manager" exits)
+-- Grouped into a table to stay under LuaJIT's 200-local limit
+local pmenu = {
+    open = false,
+    toolsOpen = false,
+    sel = 1,
+    toolsSel = 1,
+    items = {"Resume", "Tools >", "Settings >", "Reset Cart", "Quit to Program Manager"},
+    toolItems = {},   -- populated from registry at init
+    toolIds = {},     -- populated from registry at init
+}
+
 -- Forward-declared map helpers (defined after map loading code)
 local isWall  -- isWall(mx, my) -> bool; needed by hasLOS/enemyStepToward/updateProjectiles
 
 -- ============================================================================
 -- INVENTORY + ITEMS
 -- ============================================================================
-local INV_SIZE = 12     -- 4x3 grid
-local INV_COLS = 4
-local INV_ROWS = 3
+local INV = { SIZE = 12, COLS = 4, ROWS = 3 }  -- 4x3 grid
 
 -- Item database: templates keyed by id
 local ITEM_DB = {
@@ -164,7 +179,7 @@ local equipArmor       -- index into inventory (or nil)
 
 -- Inventory UI state
 local invOpen          -- true when inventory modal is visible
-local invCursor        -- 0-based index (0..INV_SIZE-1)
+local invCursor        -- 0-based index (0..INV.SIZE-1)
 
 -- Map entities: pickups on the ground
 local entities         -- array of {type="pickup", x=N, y=N, itemId=string, qty=N}
@@ -173,14 +188,16 @@ local entities         -- array of {type="pickup", x=N, y=N, itemId=string, qty=
 local enemies          -- array of enemy tables
 local enemySpawns      -- array of {x=N, y=N} for editor persistence
 
--- Enemy constants
-local ENEMY_HP        = 30
-local ENEMY_SPEED     = 1.2    -- tiles per second when chasing
-local ENEMY_SIGHT     = 6      -- detection range in tiles
-local ENEMY_ATK_DMG   = 8      -- damage per hit
-local ENEMY_ATK_CD    = 1.0    -- attack cooldown seconds
-local ENEMY_MOVE_CD   = 0.6    -- seconds between chase steps
-local ENEMY_DROP      = { "potion", "arrow" }  -- random drop on death
+-- Enemy constants (grouped to reduce local count)
+local ENEMY = {
+    HP        = 30,
+    SPEED     = 1.2,      -- tiles per second when chasing
+    SIGHT     = 6,        -- detection range in tiles
+    ATK_DMG   = 8,        -- damage per hit
+    ATK_CD    = 1.0,      -- attack cooldown seconds
+    MOVE_CD   = 0.6,      -- seconds between chase steps
+    DROP      = { "potion", "arrow" },  -- random drop on death
+}
 
 -- Projectiles
 local projectiles      -- array of {x,y,dx,dy,speed,dmg,life}
@@ -188,6 +205,47 @@ local projectiles      -- array of {x,y,dx,dy,speed,dmg,life}
 -- Combat visual feedback
 local screenShake      -- {timer, intensity} or nil
 local meleeFlash       -- timer for melee swing visual (>0 while showing)
+local stamFlash        -- timer for stamina bar flash when insufficient (>0 while flashing)
+
+-- Weapon definitions: timing in seconds, data-driven combat
+local WEAPONS = {
+    knife = {
+        id = "knife", type = "melee",
+        dmg = 15, range = 1.2, coneDeg = 25,
+        cost = 12,
+        windup  = 0.12,   -- anticipation phase
+        strike  = 0.10,   -- active swing window
+        recover = 0.22,   -- cooldown before next action
+        hitAt   = 0.03,   -- seconds into STRIKE when hit check fires
+        sfxWindup = "step",
+        sfxHit    = "bump",
+        sfxMiss   = "turn",
+    },
+    bow = {
+        id = "bow", type = "ranged",
+        dmg = 10, projSpeed = 8.0, ammoId = "arrow",
+        cost = 8,
+        windup  = 0.20,   -- draw phase
+        strike  = 0.01,   -- release is nearly instant
+        recover = 0.35,   -- re-nock cooldown
+        hitAt   = 0.00,   -- fires immediately on STRIKE enter
+        sfxWindup = "ui_move",
+        sfxHit    = "bump",
+        sfxMiss   = "ui_select",
+    },
+    fist = {
+        id = "fist", type = "melee",
+        dmg = 5, range = 1.0, coneDeg = 30,
+        cost = 8,
+        windup  = 0.08,
+        strike  = 0.10,
+        recover = 0.30,
+        hitAt   = 0.02,
+        sfxWindup = "step",
+        sfxHit    = "bump",
+        sfxMiss   = "turn",
+    },
+}
 
 -- ============================================================================
 -- HELPERS
@@ -204,9 +262,9 @@ local function clamp(v, lo, hi) return math_max(lo, math_min(hi, v)) end
 local function calcLight(dist)
     -- Read live settings (fall back to constants if consoleRef not yet set)
     local fogStr = (consoleRef and consoleRef.fogStrength) or 1.0
-    local tRadius = (consoleRef and consoleRef.torchRadius) or TORCH_RADIUS
-    local tStrength = (consoleRef and consoleRef.torchStrength) or TORCH_STRENGTH
-    local fogDist = FOG_DIST / math_max(fogStr, 0.01)
+    local tRadius = (consoleRef and consoleRef.torchRadius) or LIGHTING.TORCH_RADIUS
+    local tStrength = (consoleRef and consoleRef.torchStrength) or LIGHTING.TORCH_STRENGTH
+    local fogDist = LIGHTING.FOG_DIST / math_max(fogStr, 0.01)
 
     local fog   = clamp(1.0 - (dist / fogDist), 0.0, 1.0)
     local torch = 0
@@ -214,7 +272,7 @@ local function calcLight(dist)
         torch = clamp(1.0 - (dist / tRadius), 0.0, 1.0)
         torch = torch * torch * torch * 0.5 + torch * 0.5  -- ~pow 1.5 approx
     end
-    return clamp(AMBIENT + fog * 0.45 + torch * tStrength * 0.55, 0.0, 1.0)
+    return clamp(LIGHTING.AMBIENT + fog * 0.45 + torch * tStrength * 0.55, 0.0, 1.0)
 end
 
 local function addLog(text)
@@ -232,14 +290,14 @@ local function invNewSlot(itemId, qty)
 end
 
 local function invFindItem(itemId)
-    for i = 1, INV_SIZE do
+    for i = 1, INV.SIZE do
         if inventory[i] and inventory[i].id == itemId then return i end
     end
     return nil
 end
 
 local function invFindEmpty()
-    for i = 1, INV_SIZE do
+    for i = 1, INV.SIZE do
         if not inventory[i] then return i end
     end
     return nil
@@ -359,7 +417,7 @@ end
 local function spawnEnemy(mx, my)
     enemies[#enemies + 1] = {
         x = mx + 0.5, y = my + 0.5,  -- center of tile
-        hp = ENEMY_HP,
+        hp = ENEMY.HP,
         state = "idle",     -- idle | chase | dead
         atkTimer = 0,       -- cooldown before next attack
         moveTimer = 0,      -- cooldown before next step
@@ -446,7 +504,7 @@ local function updateEnemies(dt)
                 e.state = "dead"
                 e.flashTimer = 0.3
                 -- Drop loot
-                local dropId = ENEMY_DROP[math.random(#ENEMY_DROP)]
+                local dropId = ENEMY.DROP[math.random(#ENEMY.DROP)]
                 local dropQty = (dropId == "arrow") and math.random(2, 5) or 1
                 spawnPickup(math_floor(e.x), math_floor(e.y), dropId, dropQty)
                 addLog("ENEMY KILLED!")
@@ -467,13 +525,13 @@ local function updateEnemies(dt)
         -- State transitions
         if e.state == "idle" then
             -- Detect player within sight range + LOS
-            if dist <= ENEMY_SIGHT and hasLOS(e.x, e.y, px, py) then
+            if dist <= ENEMY.SIGHT and hasLOS(e.x, e.y, px, py) then
                 e.state = "chase"
-                e.moveTimer = ENEMY_MOVE_CD * 0.5  -- short initial delay
+                e.moveTimer = ENEMY.MOVE_CD * 0.5  -- short initial delay
             end
         elseif e.state == "chase" then
             -- Lose aggro if player too far or no LOS
-            if dist > ENEMY_SIGHT * 1.5 or not hasLOS(e.x, e.y, px, py) then
+            if dist > ENEMY.SIGHT * 1.5 or not hasLOS(e.x, e.y, px, py) then
                 e.state = "idle"
                 goto nextEnemy
             end
@@ -482,9 +540,9 @@ local function updateEnemies(dt)
             if dist < 1.2 then
                 e.atkTimer = e.atkTimer - dt
                 if e.atkTimer <= 0 then
-                    player.hp = player.hp - ENEMY_ATK_DMG
-                    e.atkTimer = ENEMY_ATK_CD
-                    addLog("ENEMY HIT YOU! -" .. ENEMY_ATK_DMG .. " HP")
+                    player.hp = player.hp - ENEMY.ATK_DMG
+                    e.atkTimer = ENEMY.ATK_CD
+                    addLog("ENEMY HIT YOU! -" .. ENEMY.ATK_DMG .. " HP")
                     if sfx then sfx.play("bump") end
                 end
             else
@@ -492,7 +550,7 @@ local function updateEnemies(dt)
                 e.moveTimer = e.moveTimer - dt
                 if e.moveTimer <= 0 then
                     enemyStepToward(e)
-                    e.moveTimer = ENEMY_MOVE_CD
+                    e.moveTimer = ENEMY.MOVE_CD
                 end
             end
         end
@@ -510,95 +568,75 @@ local function triggerScreenShake(intensity, duration)
     screenShake = { timer = duration or 0.15, intensity = intensity or 2 }
 end
 
-local function doMeleeAttack()
-    -- Already on cooldown?
-    if player.attackCooldown > 0 then return end
+-- ============================================================================
+-- WEAPON STATE MACHINE
+-- ============================================================================
 
-    -- Check stamina
-    if player.stam < MELEE_COST then
-        addLog("TOO TIRED")
-        return
+--- Get the weapon definition for a given attack kind ("melee" or "ranged").
+--- Returns a WEAPONS entry, or nil if ranged weapon not equipped.
+local function weaponGetDef(kind)
+    if kind == "melee" then
+        if equipMelee and inventory[equipMelee] then
+            local itemId = inventory[equipMelee].id
+            return WEAPONS[itemId] or WEAPONS.fist
+        end
+        return WEAPONS.fist
+    elseif kind == "ranged" then
+        if not equipRanged or not inventory[equipRanged] then
+            return nil
+        end
+        local itemId = inventory[equipRanged].id
+        return WEAPONS[itemId]
     end
+    return nil
+end
 
-    -- Get equipped melee weapon stats (or bare fists)
-    local dmg = 5  -- bare fist fallback
-    local cooldown = 0.5
-    if equipMelee and inventory[equipMelee] then
-        local db = ITEM_DB[inventory[equipMelee].id]
-        if db and db.dmg then dmg = db.dmg end
-        if db and db.cooldown then cooldown = db.cooldown end
-    end
-
-    -- Drain stamina + set cooldown
-    player.stam = math_max(0, player.stam - MELEE_COST)
-    player.attackCooldown = cooldown
-
-    -- Visual feedback
-    meleeFlash = 0.12
-    triggerScreenShake(2, 0.08)
-
-    -- Check for enemies in melee cone (distance <= 1.5, angle within 25 degrees)
+--- Execute the melee hit check: find the SINGLE nearest enemy in cone+range.
+local function weaponDoHitMelee(def)
     local px, py = player.x, player.y
     local pAngle = player.angle
-    local hitAny = false
+    local coneRad = math.rad(def.coneDeg or 25)
+    local bestDist = math.huge
+    local bestEnemy = nil
 
     for _, e in ipairs(enemies) do
         if e.hp > 0 then
             local ddx = e.x - px
             local ddy = e.y - py
             local dist = math.sqrt(ddx * ddx + ddy * ddy)
-            if dist <= 1.5 then
-                -- Check angle
+            if dist <= (def.range or 1.2) and dist < bestDist then
                 local angleToEnemy = math.atan2(ddy, ddx)
                 local diff = angleToEnemy - pAngle
-                -- Normalize to [-pi, pi]
                 diff = (diff + math.pi) % (2 * math.pi) - math.pi
-                if math_abs(diff) < math.rad(25) then
-                    e.hp = e.hp - dmg
-                    e.flashTimer = 0.15
-                    hitAny = true
-                    addLog("HIT! -" .. dmg .. " DMG")
-                    if sfx then sfx.play("bump") end
+                if math_abs(diff) < coneRad then
+                    bestDist = dist
+                    bestEnemy = e
                 end
             end
         end
     end
 
-    if not hitAny then
+    if bestEnemy then
+        bestEnemy.hp = bestEnemy.hp - (def.dmg or 5)
+        bestEnemy.flashTimer = 0.15
+        addLog("HIT! -" .. (def.dmg or 5) .. " DMG")
+        if sfx then sfx.play(def.sfxHit or "bump") end
+        triggerScreenShake(2, 0.08)
+    else
         addLog("SWING!")
-        if sfx then sfx.play("step") end
+        if sfx then sfx.play(def.sfxMiss or "turn") end
     end
 end
 
-local function doRangedAttack()
-    -- Already on cooldown?
-    if player.attackCooldown > 0 then return end
-
-    -- Check stamina
-    if player.stam < RANGED_COST then
-        addLog("TOO TIRED")
-        return
-    end
-
-    -- Must have ranged weapon equipped
-    if not equipRanged or not inventory[equipRanged] then
-        addLog("NO RANGED WEAPON")
-        return
-    end
-
-    local slot = inventory[equipRanged]
-    local db = ITEM_DB[slot.id]
-    if not db then return end
-
-    -- Check ammo
-    local ammoId = db.ammoId
+--- Execute ranged shot: consume ammo, spawn projectile.
+local function weaponDoShootRanged(def)
+    local ammoId = def.ammoId
     if ammoId then
         local ammoIdx = invFindItem(ammoId)
         if not ammoIdx then
             addLog("NO " .. (ITEM_DB[ammoId] and ITEM_DB[ammoId].name or "AMMO"))
             return
         end
-        -- Consume 1 ammo
         local ammoSlot = inventory[ammoIdx]
         ammoSlot.qty = ammoSlot.qty - 1
         if ammoSlot.qty <= 0 then
@@ -606,11 +644,6 @@ local function doRangedAttack()
         end
     end
 
-    -- Drain stamina + set cooldown
-    player.stam = math_max(0, player.stam - RANGED_COST)
-    player.attackCooldown = db.cooldown or 0.5
-
-    -- Spawn projectile
     local dirX = math_cos(player.angle)
     local dirY = math_sin(player.angle)
     projectiles[#projectiles + 1] = {
@@ -618,13 +651,98 @@ local function doRangedAttack()
         y = player.y + dirY * 0.3,
         dx = dirX,
         dy = dirY,
-        speed = 8.0,
-        dmg = db.dmg or 10,
-        life = 2.0,  -- seconds before despawn
+        speed = def.projSpeed or 8.0,
+        dmg = def.dmg or 10,
+        life = 2.0,
     }
 
     addLog("FIRED!")
-    if sfx then sfx.play("ui_select") end
+    if sfx then sfx.play(def.sfxHit or "ui_select") end
+end
+
+--- Try to begin an attack. Called from cart.input.
+--- If already attacking, buffers the input for queued attack.
+local function weaponStartAttack(kind)
+    local wpn = player.wpn
+
+    -- If currently attacking, buffer input
+    if wpn.state ~= "IDLE" then
+        wpn.queue = kind
+        return
+    end
+
+    local def = weaponGetDef(kind)
+    if not def then
+        if kind == "ranged" then
+            addLog("NO RANGED WEAPON")
+        end
+        return
+    end
+
+    if player.stam < def.cost then
+        addLog("TOO TIRED")
+        stamFlash = 0.25
+        return
+    end
+
+    -- Commit: drain stamina and enter WINDUP
+    player.stam = math_max(0, player.stam - def.cost)
+    wpn.state  = "WINDUP"
+    wpn.t      = 0
+    wpn.didHit = false
+    wpn.mode   = kind
+    wpn.def    = def
+
+    if sfx then sfx.play(def.sfxWindup or "step") end
+end
+
+--- Tick the weapon state machine. Called from cart.update every frame.
+local function weaponUpdate(dt)
+    local wpn = player.wpn
+    if wpn.state == "IDLE" then
+        if wpn.queue then
+            local kind = wpn.queue
+            wpn.queue = nil
+            weaponStartAttack(kind)
+        end
+        return
+    end
+
+    wpn.t = wpn.t + dt
+    local def = wpn.def
+
+    if wpn.state == "WINDUP" then
+        if wpn.t >= (def.windup or 0.12) then
+            wpn.state = "STRIKE"
+            wpn.t = 0
+            if wpn.mode == "melee" then
+                meleeFlash = def.strike or 0.10
+            end
+        end
+
+    elseif wpn.state == "STRIKE" then
+        if not wpn.didHit and wpn.t >= (def.hitAt or 0) then
+            wpn.didHit = true
+            if wpn.mode == "melee" then
+                weaponDoHitMelee(def)
+            elseif wpn.mode == "ranged" then
+                weaponDoShootRanged(def)
+            end
+        end
+
+        if wpn.t >= (def.strike or 0.10) then
+            wpn.state = "RECOVER"
+            wpn.t = 0
+        end
+
+    elseif wpn.state == "RECOVER" then
+        if wpn.t >= (def.recover or 0.22) then
+            wpn.state = "IDLE"
+            wpn.t = 0
+            wpn.def = nil
+            wpn.mode = nil
+        end
+    end
 end
 
 local function updateProjectiles(dt)
@@ -1001,7 +1119,7 @@ local function applyPlayerStart()
     player.stam = player.stamMax
     player.dead = false
     player.deathTimer = 0
-    player.attackCooldown = 0
+    player.wpn = { state = "IDLE", t = 0, didHit = false, queue = nil, mode = nil, def = nil }
     -- Respawn enemies from spawn points
     if enemySpawns then
         spawnEnemiesFromSpawns()
@@ -1012,6 +1130,7 @@ local function applyPlayerStart()
     end
     screenShake = nil
     meleeFlash = 0
+    stamFlash = 0
 end
 
 -- ============================================================================
@@ -1353,6 +1472,353 @@ local function drawSkybox()
 end
 
 -- ============================================================================
+-- NPC BILLBOARD RENDERING (character composites)
+-- ============================================================================
+
+--- Create a simple procedural character image (used when no composite asset exists).
+local function buildFallbackNPCImage()
+    local w, h = 32, 48
+    local canvas = love.graphics.newCanvas(w, h)
+    canvas:setFilter("nearest", "nearest")
+    love.graphics.setCanvas(canvas)
+    love.graphics.clear(0, 0, 0, 0)
+    -- Head (circle-ish)
+    love.graphics.setColor(0.85, 0.65, 0.45, 1)
+    love.graphics.rectangle("fill", 11, 2, 10, 10)
+    -- Body
+    love.graphics.setColor(0.2, 0.3, 0.7, 1)
+    love.graphics.rectangle("fill", 9, 12, 14, 14)
+    -- Legs
+    love.graphics.setColor(0.3, 0.2, 0.15, 1)
+    love.graphics.rectangle("fill", 10, 26, 5, 12)
+    love.graphics.rectangle("fill", 17, 26, 5, 12)
+    -- Arms
+    love.graphics.setColor(0.85, 0.65, 0.45, 1)
+    love.graphics.rectangle("fill", 5, 13, 4, 10)
+    love.graphics.rectangle("fill", 23, 13, 4, 10)
+    -- Eyes
+    love.graphics.setColor(0.1, 0.1, 0.1, 1)
+    love.graphics.rectangle("fill", 13, 5, 2, 2)
+    love.graphics.rectangle("fill", 18, 5, 2, 2)
+    love.graphics.setCanvas()
+    love.graphics.setColor(1, 1, 1, 1)
+    local imgData = canvas:newImageData()
+    local img = love.graphics.newImage(imgData)
+    img:setFilter("nearest", "nearest")
+    imgData:release()
+    canvas:release()
+    return img, h  -- pivotY at bottom (feet)
+end
+
+--- Try loading a character composite, fall back to procedural image.
+local function initTestNPC()
+    npcs = {}
+    local img, pivotY
+    -- Try to find a character composite on disk
+    if sprites then
+        local composites = sprites.listAssets("characters", "composites")
+        if composites and #composites > 0 then
+            local asset = sprites.loadAsset("characters/composites/" .. composites[1])
+            if asset and asset.meta and asset.meta.mode == "composite" then
+                img = sprites.renderCompositeToImage(asset)
+                pivotY = (asset.pivot and asset.pivot.y) or 120
+            end
+        end
+    end
+    if not img then
+        img, pivotY = buildFallbackNPCImage()
+    end
+    -- Place test NPC at tile (4,4) center
+    npcs[#npcs + 1] = {
+        x = 4.5, y = 4.5,
+        img = img,
+        imgW = img:getWidth(),
+        imgH = img:getHeight(),
+        pivotY = pivotY,
+    }
+end
+
+local function renderNPCs()
+    if not npcs or #npcs == 0 then return end
+
+    local fovRad = math.rad((consoleRef and consoleRef.fovDeg) or 60)
+    local halfFov = fovRad / 2
+    local halfH = VP_H / 2
+    local pAngle = player.angle
+    local px, py = player.x, player.y
+
+    local dirX = math_cos(pAngle)
+    local dirY = math_sin(pAngle)
+    local planeScale = math.tan(halfFov)
+    local planeX = -dirY * planeScale
+    local planeY =  dirX * planeScale
+
+    love.graphics.setScissor(VP_X, VP_Y, VP_W, VP_H)
+
+    -- Sort by distance (far first)
+    local sorted = {}
+    for _, n in ipairs(npcs) do
+        local dx = n.x - px
+        local dy = n.y - py
+        sorted[#sorted + 1] = { n = n, dist2 = dx*dx + dy*dy }
+    end
+    table.sort(sorted, function(a, b) return a.dist2 > b.dist2 end)
+
+    for _, sn in ipairs(sorted) do
+        local n = sn.n
+        local dx = n.x - px
+        local dy = n.y - py
+
+        local invDet = 1.0 / (planeX * dirY - dirX * planeY)
+        local transformX = invDet * (dirY * dx - dirX * dy)
+        local transformY = invDet * (-planeY * dx + planeX * dy)
+
+        if transformY > 0.1 then
+            local spriteScreenX = math_floor((VP_W / 2) * (1 + transformX / transformY))
+
+            -- Full tile height on screen
+            local tileScreenH = math_abs(VP_H / transformY)
+            -- Sprite occupies its height proportional to tile (128px part in a 1.0 tile)
+            local sprScale = tileScreenH / n.imgH
+            -- Anchor: pivotY maps to ground level (halfH in screen space for a 1-tile object)
+            local spriteH = math_floor(n.imgH * sprScale)
+            local spriteW = math_floor(n.imgW * sprScale)
+            if spriteW < 2 or spriteH < 2 then goto continueNPC end
+
+            -- Floor Y on screen at this depth: halfH + half a tile height
+            local floorY = halfH + tileScreenH * 0.5
+            -- pivotY is in pixel coords from image top; the feet are at pivotY
+            -- The bottom of the drawn sprite (at pivotY) should align with the floor
+            local drawTopY = math_floor(floorY - n.pivotY * sprScale)
+
+            local drawStartX = spriteScreenX - math_floor(spriteW / 2)
+            local drawEndX   = drawStartX + spriteW
+
+            -- Lighting
+            local shade = calcLight(transformY)
+
+            -- Draw visible column spans (depth-tested, batched)
+            gfx.setColorRGBA(shade, shade, shade, 1)
+            local spanStart = nil
+            local colMin = math_max(drawStartX, 0)
+            local colMax = math_min(drawEndX - 1, VP_W - 1)
+            for sx = colMin, colMax + 1 do
+                local visible = sx <= colMax and transformY < (zBuffer[sx] or MAX_DIST)
+                if visible and not spanStart then
+                    spanStart = sx
+                elseif not visible and spanStart then
+                    -- Draw the visible span using scissor
+                    love.graphics.setScissor(VP_X + spanStart, VP_Y, sx - spanStart, VP_H)
+                    love.graphics.draw(n.img, VP_X + drawStartX, VP_Y + drawTopY, 0, sprScale, sprScale)
+                    spanStart = nil
+                end
+            end
+        end
+        ::continueNPC::
+    end
+
+    love.graphics.setScissor()
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- ============================================================================
+-- WEAPON OVERLAY (first-person weapon + hands)
+-- ============================================================================
+
+--- Build a simple procedural weapon image (fallback when no sprite asset exists).
+local function buildFallbackWeapon(weaponId)
+    local w, h = 32, 48
+    local canvas = love.graphics.newCanvas(w, h)
+    canvas:setFilter("nearest", "nearest")
+    love.graphics.setCanvas(canvas)
+    love.graphics.clear(0, 0, 0, 0)
+    if weaponId == "bow" then
+        -- Simple bow shape
+        love.graphics.setColor(0.55, 0.35, 0.15, 1)
+        love.graphics.rectangle("fill", 14, 2, 4, 44)   -- stave
+        love.graphics.setColor(0.8, 0.8, 0.7, 1)
+        love.graphics.rectangle("fill", 16, 2, 1, 44)   -- string
+    elseif weaponId == "fist" then
+        -- No weapon, just transparent
+    else
+        -- Sword/knife shape
+        love.graphics.setColor(0.7, 0.7, 0.75, 1)
+        love.graphics.rectangle("fill", 13, 2, 6, 30)   -- blade
+        love.graphics.setColor(0.9, 0.85, 0.3, 1)
+        love.graphics.rectangle("fill", 11, 32, 10, 3)  -- crossguard
+        love.graphics.setColor(0.45, 0.25, 0.1, 1)
+        love.graphics.rectangle("fill", 14, 35, 4, 11)  -- grip
+    end
+    love.graphics.setCanvas()
+    love.graphics.setColor(1, 1, 1, 1)
+    local imgData = canvas:newImageData()
+    local img = love.graphics.newImage(imgData)
+    img:setFilter("nearest", "nearest")
+    imgData:release()
+    canvas:release()
+    return img
+end
+
+--- Build a simple procedural hand image (fallback).
+local function buildFallbackHand()
+    local w, h = 32, 32
+    local canvas = love.graphics.newCanvas(w, h)
+    canvas:setFilter("nearest", "nearest")
+    love.graphics.setCanvas(canvas)
+    love.graphics.clear(0, 0, 0, 0)
+    -- Palm
+    love.graphics.setColor(0.85, 0.65, 0.45, 1)
+    love.graphics.rectangle("fill", 8, 8, 16, 18)
+    -- Fingers (curled around weapon grip)
+    love.graphics.rectangle("fill", 6, 4, 5, 8)
+    love.graphics.rectangle("fill", 11, 2, 5, 8)
+    love.graphics.rectangle("fill", 16, 2, 5, 8)
+    love.graphics.rectangle("fill", 21, 4, 5, 8)
+    -- Thumb
+    love.graphics.setColor(0.80, 0.60, 0.40, 1)
+    love.graphics.rectangle("fill", 4, 12, 6, 10)
+    love.graphics.setCanvas()
+    love.graphics.setColor(1, 1, 1, 1)
+    local imgData = canvas:newImageData()
+    local img = love.graphics.newImage(imgData)
+    img:setFilter("nearest", "nearest")
+    imgData:release()
+    canvas:release()
+    return img
+end
+
+--- Load weapon overlay images. Tries sprite assets first, falls back to procedural.
+local function initWeaponOverlay()
+    wpnOverlay = {}
+    wpnBobTimer = 0
+
+    -- Try loading sprite assets for each weapon type
+    for weaponId, _ in pairs(WEAPONS) do
+        local entry = { weapon = nil, hand = nil }
+
+        -- Try loading weapon sprite: sprites/weapons/<weaponId>.lua
+        if sprites then
+            local asset = sprites.loadAsset("weapons/" .. weaponId)
+            if asset and asset.layers then
+                -- Use first layer as weapon image
+                entry.weapon = sprites.renderLayerToImage(asset, 1, 1)
+            end
+            -- Try loading hand sprite: sprites/hands/human_hand.lua
+            local handAsset = sprites.loadAsset("hands/human_hand")
+            if handAsset and handAsset.layers then
+                entry.hand = sprites.renderLayerToImage(handAsset, 1, 1)
+            end
+        end
+
+        -- Fallbacks
+        if not entry.weapon then
+            entry.weapon = buildFallbackWeapon(weaponId)
+        end
+        if not entry.hand then
+            entry.hand = buildFallbackHand()
+        end
+
+        wpnOverlay[weaponId] = entry
+    end
+end
+
+--- Draw the first-person weapon + hand overlay.
+--- Called after drawViewport(), inside screen shake transform.
+local function drawWeaponOverlay()
+    local wpn = player.wpn
+    local def = wpn.def
+    -- During active attack, use the attack weapon; during IDLE, show equipped melee
+    local weaponId
+    if def then
+        weaponId = def.id
+    elseif equipMelee and inventory[equipMelee] then
+        weaponId = inventory[equipMelee].id
+    else
+        weaponId = "fist"
+    end
+    local entry = wpnOverlay and wpnOverlay[weaponId]
+    if not entry then return end
+
+    local state = wpn.state
+    local t = wpn.t
+
+    -- Base position: bottom-center-right of viewport
+    local baseX = VP_X + VP_W * 0.5
+    local baseY = VP_Y + VP_H - 4
+    local scale = 2.0  -- scale up the small sprites
+
+    local weaponImg = entry.weapon
+    local handImg   = entry.hand
+
+    -- Animation offsets based on weapon state
+    local offX, offY = 0, 0
+    local rot = 0  -- rotation in radians
+
+    if state == "WINDUP" then
+        -- Pull back: move right and down, slight rotation
+        local frac = def and (t / def.windup) or 0
+        frac = math_min(frac, 1)
+        -- smoothstep
+        frac = frac * frac * (3 - 2 * frac)
+        offX = frac * 20
+        offY = frac * 10
+        rot  = frac * 0.3
+    elseif state == "STRIKE" then
+        -- Swing forward: move left and up quickly
+        local frac = def and (t / def.strike) or 0
+        frac = math_min(frac, 1)
+        frac = frac * frac * (3 - 2 * frac)
+        offX = 20 - frac * 50   -- from pulled-back to forward
+        offY = 10 - frac * 30   -- from down to up
+        rot  = 0.3 - frac * 0.8 -- swing through
+    elseif state == "RECOVER" then
+        -- Return to rest from strike end position
+        local frac = def and (t / def.recover) or 0
+        frac = math_min(frac, 1)
+        frac = frac * frac * (3 - 2 * frac)
+        offX = -30 + frac * 30  -- from forward back to center
+        offY = -20 + frac * 20
+        rot  = -0.5 + frac * 0.5
+    end
+
+    -- Walk bob (sinusoidal)
+    local bobY = 0
+    if wpnBobTimer > 0 then
+        bobY = math.sin(wpnBobTimer * 10) * 3
+    end
+
+    -- Final position (anchor at bottom-center of weapon)
+    local drawX = baseX + offX
+    local drawY = baseY + offY + bobY
+
+    -- Scissor to viewport
+    love.graphics.setScissor(VP_X, VP_Y, VP_W, VP_H)
+
+    -- Draw weapon underneath (origin at bottom-center)
+    if weaponId ~= "fist" then
+        gfx.setColorRGBA(1, 1, 1, 1)
+        love.graphics.draw(weaponImg,
+            drawX, drawY,
+            rot,
+            scale, scale,
+            weaponImg:getWidth() * 0.5, weaponImg:getHeight()  -- origin: bottom-center
+        )
+    end
+
+    -- Draw hand on top (positioned at grip area)
+    gfx.setColorRGBA(1, 1, 1, 1)
+    love.graphics.draw(handImg,
+        drawX, drawY,
+        rot * 0.5,  -- hand rotates less than weapon
+        scale, scale,
+        handImg:getWidth() * 0.5, handImg:getHeight() * 0.3  -- origin: upper-center
+    )
+
+    love.graphics.setScissor()
+    love.graphics.setColor(1, 1, 1, 1)
+end
+
+-- ============================================================================
 -- ENEMY BILLBOARD RENDERING
 -- ============================================================================
 local function renderEnemies()
@@ -1470,22 +1936,35 @@ local function drawViewport()
         local lowW = math_floor(VP_W / 2)
         local lowH = math_floor(VP_H / 2)
         renderFloorCeiling(floorCeilImageDataLow, lowW, lowH)
-        floorCeilImageLow:replacePixels(floorCeilImageDataLow)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.draw(floorCeilImageLow, VP_X, VP_Y, 0, 2, 2)
+        if floorCeilImageLow then
+            floorCeilImageLow:replacePixels(floorCeilImageDataLow)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.draw(floorCeilImageLow, VP_X, VP_Y, 0, 2, 2)
+        else
+            love.graphics.setColor(0.15, 0.12, 0.18, 1)
+            love.graphics.rectangle("fill", VP_X, VP_Y, VP_W, VP_H)
+        end
         -- Walls: skip every other column, draw 2-wide strips
         renderWalls(2)
     else
         -- CRISP mode: full resolution
         renderFloorCeiling(floorCeilImageData, VP_W, VP_H)
-        floorCeilImage:replacePixels(floorCeilImageData)
-        love.graphics.setColor(1, 1, 1, 1)
-        love.graphics.draw(floorCeilImage, VP_X, VP_Y)
+        if floorCeilImage then
+            floorCeilImage:replacePixels(floorCeilImageData)
+            love.graphics.setColor(1, 1, 1, 1)
+            love.graphics.draw(floorCeilImage, VP_X, VP_Y)
+        else
+            love.graphics.setColor(0.15, 0.12, 0.18, 1)
+            love.graphics.rectangle("fill", VP_X, VP_Y, VP_W, VP_H)
+        end
         renderWalls(1)
     end
 
     -- Render enemy billboards (after walls, depth-tested)
     renderEnemies()
+
+    -- Render NPC billboards (character composites)
+    renderNPCs()
 
     -- Render projectiles as small bright dots
     if projectiles and #projectiles > 0 then
@@ -1623,15 +2102,30 @@ local function drawStats()
     local hpStr = math_floor(player.hp) .. "/" .. player.hpMax
     gfx.print(hpStr, sx + barW - gfx.textWidth(hpStr), sy, 7)
 
-    -- Stamina bar
+    -- Stamina bar (flashes when insufficient)
     sy = sy + 10
-    gfx.print("ST", sx, sy, 14)
-    drawStatBar(sx + 16, sy + 1, barW - 16, 6, player.stam, player.stamMax, 6, 0)
+    local stamCol = 6  -- green
+    if stamFlash and stamFlash > 0 then
+        -- Blink between red and yellow at ~8Hz
+        stamCol = (math_floor(stamFlash * 8) % 2 == 0) and 12 or 14
+    end
+    gfx.print("ST", sx, sy, stamCol == 6 and 14 or stamCol)
+    drawStatBar(sx + 16, sy + 1, barW - 16, 6, player.stam, player.stamMax, stamCol, 0)
     local stStr = math_floor(player.stam) .. "/" .. player.stamMax
     gfx.print(stStr, sx + barW - gfx.textWidth(stStr), sy, 7)
 
+    -- Weapon state (only shown when not IDLE)
+    if player.wpn.state ~= "IDLE" then
+        sy = sy + 10
+        local wpnState = player.wpn.state
+        local stateCol = wpnState == "WINDUP" and 14 or wpnState == "STRIKE" and 12 or 8
+        gfx.print(wpnState, sx, sy, stateCol)
+    else
+        sy = sy + 10
+    end
+
     -- Compact position + torch
-    sy = sy + 12
+    sy = sy + 2
     local deg = math_floor(math.deg(player.angle) % 360)
     gfx.print(string.format("%.0f,%.0f %d", player.x, player.y, deg), sx, sy, 8)
     sy = sy + 10
@@ -1669,8 +2163,8 @@ local function drawInventory()
     -- Panel dimensions
     local cellSz = 22
     local pad = 4
-    local pw = INV_COLS * cellSz + pad * 2 + 2
-    local ph = INV_ROWS * cellSz + pad * 2 + 30  -- extra for title + equip info
+    local pw = INV.COLS * cellSz + pad * 2 + 2
+    local ph = INV.ROWS * cellSz + pad * 2 + 30  -- extra for title + equip info
     local px = math_floor((VIRT_W - pw) / 2)
     local py = math_floor((VIRT_H - ph) / 2)
 
@@ -1694,9 +2188,9 @@ local function drawInventory()
     local gy = py + 14
 
     -- Draw grid cells
-    for i = 0, INV_SIZE - 1 do
-        local col = i % INV_COLS
-        local row = math_floor(i / INV_COLS)
+    for i = 0, INV.SIZE - 1 do
+        local col = i % INV.COLS
+        local row = math_floor(i / INV.COLS)
         local cx = gx + col * cellSz
         local cy = gy + row * cellSz
         local slotIdx = i + 1
@@ -1740,7 +2234,7 @@ local function drawInventory()
     end
 
     -- Info area below grid
-    local infoY = gy + INV_ROWS * cellSz + 2
+    local infoY = gy + INV.ROWS * cellSz + 2
     local selSlot = inventory[invCursor + 1]
     if selSlot then
         local db = ITEM_DB[selSlot.id]
@@ -1771,24 +2265,28 @@ local function drawBevel(x, y, w, h)
 end
 
 local function loadTextureData(img)
-    -- Convert a love.graphics.Image to ImageData for pixel sampling
-    local w, h = img:getWidth(), img:getHeight()
-    local canvas = love.graphics.newCanvas(w, h)
-    local prevCanvas = love.graphics.getCanvas()
-    love.graphics.setCanvas(canvas)
-    love.graphics.clear(0, 0, 0, 1)
-    love.graphics.setColor(1, 1, 1, 1)
-    love.graphics.setBlendMode("replace")
-    love.graphics.draw(img, 0, 0)
-    love.graphics.setBlendMode("alpha")
-    love.graphics.setCanvas(prevCanvas)
-    local data = canvas:newImageData()
-    return data
+    if not img then return nil end
+    local ok, data = pcall(function()
+        local w, h = img:getWidth(), img:getHeight()
+        local canvas = love.graphics.newCanvas(w, h)
+        local prevCanvas = love.graphics.getCanvas()
+        love.graphics.setCanvas(canvas)
+        love.graphics.clear(0, 0, 0, 1)
+        love.graphics.setColor(1, 1, 1, 1)
+        love.graphics.setBlendMode("replace")
+        love.graphics.draw(img, 0, 0)
+        love.graphics.setBlendMode("alpha")
+        love.graphics.setCanvas(prevCanvas)
+        return canvas:newImageData()
+    end)
+    return ok and data or nil
 end
 
 -- Compute average RGB color from ImageData (for editor swatches)
 local function computeAvgColor(imgData)
+    if not imgData then return { 0.5, 0.5, 0.5 } end
     local w, h = imgData:getWidth(), imgData:getHeight()
+    if w == 0 or h == 0 then return { 0.5, 0.5, 0.5 } end
     local rr, gg, bb = 0, 0, 0
     local count = w * h
     for py = 0, h - 1 do
@@ -1800,395 +2298,6 @@ local function computeAvgColor(imgData)
     return { rr / count, gg / count, bb / count }
 end
 
--- ============================================================================
--- MATERIAL PALETTE HELPERS
--- ============================================================================
-local EDIT_MODE_NAMES = { "COLLISION", "WALL MAT", "FLOOR MAT", "CEIL MAT", "ENEMIES" }
-local EDIT_MODE_CATS  = { nil, "walls", "floor", "ceil", nil }
-
-local function getPaletteList()
-    local cat = EDIT_MODE_CATS[editMode]
-    if not cat then return nil end
-    return texCatalog[cat]
-end
-
--- For ceiling mode, palette index 0 = "OPEN SKY" (nil ceilMat)
-local function getSelectedMatKey()
-    if editMode == 4 and paletteSel == 0 then
-        return nil  -- open sky
-    end
-    local list = getPaletteList()
-    if not list or #list == 0 then return "default" end
-    local idx = clamp(paletteSel, 1, #list)
-    return list[idx].key
-end
-
--- ============================================================================
--- EDIT MODE DRAWING
--- ============================================================================
-local function drawEditGrid()
-    -- Fill viewport area with top-down grid
-    local gridArea_W = VP_W
-    local gridArea_H = VP_H
-
-    -- Calculate cell size to fit the map in the viewport
-    local cellW = math_floor(gridArea_W / mapW)
-    local cellH = math_floor(gridArea_H / mapH)
-    local cellSize = math_min(cellW, cellH)
-    if cellSize < 2 then cellSize = 2 end
-
-    -- Center the grid in viewport
-    local totalW = cellSize * mapW
-    local totalH = cellSize * mapH
-    local ox = VP_X + math_floor((gridArea_W - totalW) / 2)
-    local oy = VP_Y + math_floor((gridArea_H - totalH) / 2)
-
-    -- Background
-    gfx.rect(VP_X, VP_Y, VP_W, VP_H, 0)
-
-    -- Draw each cell
-    for y = 1, mapH do
-        for x = 1, mapW do
-            local tile = getTile(x, y)
-            local col = TILE_COLORS[tile] or 0
-            local px = ox + (x - 1) * cellSize
-            local py = oy + (y - 1) * cellSize
-            gfx.rect(px, py, cellSize, cellSize, col)
-
-            -- Material swatch overlay based on edit mode
-            local swatchColor = nil
-            if editMode == 2 then
-                -- Wall material: show on wall tiles only
-                if tile == TILE_WALL then
-                    local key = getWallMat(x, y)
-                    if key then
-                        local entry = resolveTexEntry("walls", key)
-                        if entry and entry.avgColor then
-                            swatchColor = entry.avgColor
-                        end
-                    end
-                end
-            elseif editMode == 3 then
-                -- Floor material: show on walkable tiles (empty, door, start)
-                if tile == TILE_EMPTY or tile == TILE_DOOR or tile == TILE_START then
-                    local key = getFloorMat(x, y)
-                    if key then
-                        local entry = resolveTexEntry("floor", key)
-                        if entry and entry.avgColor then
-                            swatchColor = entry.avgColor
-                        end
-                    end
-                end
-            elseif editMode == 4 then
-                -- Roof material: show on all non-wall tiles
-                if tile ~= TILE_WALL then
-                    local key = getCeilMat(x, y)
-                    if key then
-                        local entry = resolveTexEntry("ceil", key)
-                        if entry and entry.avgColor then
-                            swatchColor = entry.avgColor
-                        end
-                    else
-                        -- nil ceilMat = open sky: small blue corner indicator
-                        if cellSize >= 4 then
-                            gfx.setColorRGBA(0.15, 0.15, 0.55, 1)
-                            local cSz = math_max(2, math_floor(cellSize / 3))
-                            love.graphics.rectangle("fill", px, py, cSz, cSz)
-                        end
-                    end
-                end
-            end
-
-            if swatchColor then
-                -- Draw a subtle swatch: fill interior with 70% opacity average color
-                gfx.setColorRGBA(swatchColor[1], swatchColor[2], swatchColor[3], 0.70)
-                love.graphics.rectangle("fill", px + 1, py + 1, cellSize - 2, cellSize - 2)
-            end
-
-            -- Draw grid lines (dark gray border between cells)
-            gfx.setColor(8)
-            love.graphics.rectangle("line", px, py, cellSize, cellSize)
-        end
-    end
-
-    -- Draw enemy spawn markers (red "E" or red squares)
-    for _, s in ipairs(enemySpawns) do
-        local esx = ox + (s.x - 1) * cellSize
-        local esy = oy + (s.y - 1) * cellSize
-        if cellSize >= 6 then
-            gfx.setColor(4) -- dark red bg
-            love.graphics.rectangle("fill", esx + 1, esy + 1, cellSize - 2, cellSize - 2)
-            gfx.print("E", esx + 1, esy, 12)
-        else
-            gfx.setColor(12)
-            love.graphics.rectangle("fill", esx, esy, cellSize, cellSize)
-        end
-    end
-
-    -- Draw player start marker (always visible, even if tile is overwritten)
-    local psx = ox + (playerStartX - 1) * cellSize
-    local psy = oy + (playerStartY - 1) * cellSize
-    -- Small "P" marker
-    if cellSize >= 6 then
-        gfx.print("P", psx + 1, psy, 15)
-    else
-        gfx.setColor(15)
-        love.graphics.rectangle("fill", psx + 1, psy + 1, cellSize - 2, cellSize - 2)
-    end
-
-    -- Draw cursor highlight (red border)
-    local cx = ox + (cursorX - 1) * cellSize
-    local cy = oy + (cursorY - 1) * cellSize
-    gfx.setColor(12) -- red
-    love.graphics.setLineWidth(1)
-    love.graphics.rectangle("line", cx, cy, cellSize, cellSize)
-    love.graphics.rectangle("line", cx + 1, cy + 1, cellSize - 2, cellSize - 2)
-
-    -- Viewport border
-    gfx.rectLine(VP_X, VP_Y, VP_W, VP_H, 8)
-end
-
-local function drawEditPanel()
-    drawBevel(RPANEL_X, RPANEL_Y, RPANEL_W, RPANEL_H)
-
-    local sx = RPANEL_X + 3
-    local sy = RPANEL_Y + 3
-    local pw = RPANEL_W - 6
-
-    -- Mode title with number keys
-    gfx.print(EDIT_MODE_NAMES[editMode] or "?", sx, sy, 0)
-    sy = sy + 10
-
-    -- Mode selector: 1-5 tabs
-    for i = 1, 5 do
-        local label = tostring(i)
-        local col = (i == editMode) and 15 or 8
-        gfx.print(label, sx + (i - 1) * 12, sy, col)
-    end
-    sy = sy + 10
-
-    -- Cursor position
-    gfx.print("CUR:" .. cursorX .. "," .. cursorY, sx, sy, 7)
-    sy = sy + 10
-
-    if editMode == 1 then
-        -- Collision mode: show brush + legend
-        local curTile = getTile(cursorX, cursorY)
-        gfx.print("TILE:" .. (TILE_NAMES[curTile] or "?"), sx, sy, 7)
-        sy = sy + 10
-
-        gfx.print("BRUSH:", sx, sy, 15)
-        sy = sy + 9
-        local brushCol = TILE_COLORS[brushType] or 0
-        gfx.rect(sx, sy, 6, 6, brushCol)
-        gfx.rectLine(sx, sy, 6, 6, 15)
-        gfx.print(TILE_NAMES[brushType] or "?", sx + 9, sy, 14)
-        sy = sy + 10
-
-        for _, tileType in ipairs(BRUSH_ORDER) do
-            local col = TILE_COLORS[tileType]
-            gfx.rect(sx, sy, 6, 6, col)
-            gfx.rectLine(sx, sy, 6, 6, 8)
-            gfx.print(TILE_NAMES[tileType], sx + 9, sy, 7)
-            sy = sy + 8
-        end
-    elseif editMode == 5 then
-        -- Enemy spawn mode: show spawn count + instructions
-        gfx.print("SPAWNS:" .. #enemySpawns, sx, sy, 12)
-        sy = sy + 10
-        -- Check if cursor is on a spawn
-        local onSpawn = false
-        for _, s in ipairs(enemySpawns) do
-            if s.x == cursorX and s.y == cursorY then onSpawn = true; break end
-        end
-        gfx.print(onSpawn and "HAS SPAWN" or "NO SPAWN", sx, sy, onSpawn and 12 or 8)
-        sy = sy + 10
-        gfx.print("A:PLACE", sx, sy, 7)
-        sy = sy + 8
-        gfx.print("X:REMOVE", sx, sy, 7)
-    else
-        -- Material mode: show palette list
-        local list = getPaletteList()
-        if list and #list > 0 then
-            -- Current tile material
-            local curKey = "default"
-            if editMode == 2 then curKey = getWallMat(cursorX, cursorY) or "default"
-            elseif editMode == 3 then curKey = getFloorMat(cursorX, cursorY) or "default"
-            elseif editMode == 4 then curKey = getCeilMat(cursorX, cursorY)
-            end
-            local curLabel = curKey and curKey:sub(1, 12) or "OPEN SKY"
-            gfx.print("CUR:" .. curLabel, sx, sy, 7)
-            sy = sy + 10
-
-            gfx.print("Q/E:SELECT", sx, sy, 8)
-            sy = sy + 10
-
-            -- Palette list (ceiling mode has index 0 = OPEN SKY)
-            local maxVisible = math_floor((RPANEL_H - sy + RPANEL_Y - 20) / 10)
-            local scroll = paletteScroll or 0
-
-            -- Draw OPEN SKY entry for ceiling mode
-            if editMode == 4 then
-                local isSel = (paletteSel == 0)
-                if isSel then
-                    gfx.rect(sx - 1, sy, pw + 2, 9, 1)
-                end
-                -- Sky swatch: dark blue block
-                gfx.setColorRGBA(0.05, 0.05, 0.15, 1)
-                love.graphics.rectangle("fill", sx, sy + 1, 7, 7)
-                gfx.rectLine(sx, sy + 1, 7, 7, 9)
-                local nameCol = isSel and 14 or 7
-                gfx.print("OPEN SKY", sx + 9, sy, nameCol)
-                sy = sy + 10
-                maxVisible = maxVisible - 1
-            end
-
-            for vi = 1, maxVisible do
-                local idx = scroll + vi
-                if idx > #list then break end
-                local entry = list[idx]
-                local isSel = (idx == paletteSel)
-
-                if isSel then
-                    gfx.rect(sx - 1, sy, pw + 2, 9, 1)
-                end
-
-                -- Small texture swatch
-                love.graphics.setColor(1, 1, 1, 1)
-                love.graphics.setScissor(sx, sy + 1, 7, 7)
-                love.graphics.draw(entry.img, sx, sy + 1, 0, 7 / entry.w, 7 / entry.h)
-                love.graphics.setScissor()
-
-                -- Name
-                local nameCol = isSel and 14 or 7
-                local shortName = entry.key:sub(1, 10)
-                gfx.print(shortName, sx + 9, sy, nameCol)
-                sy = sy + 10
-            end
-        else
-            if editMode == 4 then
-                -- Ceiling with no roof textures: still show OPEN SKY
-                local isSel = (paletteSel == 0)
-                if isSel then
-                    gfx.rect(sx - 1, sy, pw + 2, 9, 1)
-                end
-                gfx.setColorRGBA(0.05, 0.05, 0.15, 1)
-                love.graphics.rectangle("fill", sx, sy + 1, 7, 7)
-                gfx.rectLine(sx, sy + 1, 7, 7, 9)
-                gfx.print("OPEN SKY", sx + 9, sy, 14)
-                sy = sy + 10
-            else
-                gfx.print("NO TEXTURES", sx, sy, 12)
-            end
-        end
-    end
-
-    -- Bottom hint
-    gfx.print("H/Y:HELP", sx, RPANEL_Y + RPANEL_H - 10, 14)
-end
-
--- ============================================================================
--- HELP OVERLAY (edit mode)
--- ============================================================================
-local EDIT_HELP_LINES = {
-    "=== EDIT MODE CONTROLS ===",
-    "",
-    "ARROWS/DPAD Move cursor",
-    "A ......... Paint (brush/material)",
-    "B ......... Cycle brush / palette fwd",
-    "X / R ..... Erase / reset to default",
-    "S ......... Save map to file",
-    "L ......... Load map from file",
-    "P ......... Test play from start",
-    "T ......... Open tracker editor",
-    "F1/SELECT . Toggle play/edit mode",
-    "H / Y ..... Toggle this help",
-    "",
-    "=== PAINT MODES ===",
-    "",
-    "1-5 / L1 .. Cycle paint mode",
-    "  1: Collision  2: Wall material",
-    "  3: Floor mat  4: Ceiling/roof",
-    "  5: Enemy spawns",
-    "Q/E ....... Select texture in palette",
-    "X / R ..... Reset (ceil: set to sky)",
-    "",
-    "=== BRUSH TYPES (mode 1) ===",
-    "",
-    "WALL ...... Solid wall (gray)",
-    "EMPTY ..... Open space (black)",
-    "DOOR ...... Door tile (blue)",
-    "STAIRS .... Level exit (yellow)",
-    "START ..... Player spawn (green)",
-    "",
-    "=== PLAY MODE ===",
-    "",
-    "ARROWS/DPAD Move / turn",
-    "A ......... Melee attack",
-    "B ......... Ranged attack",
-    "X / F ..... Toggle torch",
-    "I / Y ..... Inventory",
-    "F1/SELECT . Back to edit mode",
-    "START/ESC . Pause menu",
-}
-
-local function drawHelpOverlay(lines)
-    -- Dark backdrop
-    gfx.setColorRGBA(0, 0, 0, 0.75)
-    love.graphics.rectangle("fill", 0, 0, VIRT_W, VIRT_H)
-
-    -- Centered panel
-    local pw, ph = 220, 160
-    local px = math_floor((VIRT_W - pw) / 2)
-    local py = math_floor((VIRT_H - ph) / 2)
-
-    -- Panel background + border
-    gfx.rect(px, py, pw, ph, 0)
-    gfx.rectLine(px, py, pw, ph, 7)
-
-    -- Inner border (raised bevel look)
-    gfx.setColor(15)
-    love.graphics.line(px + 1, py + 1, px + pw - 2, py + 1)
-    love.graphics.line(px + 1, py + 1, px + 1, py + ph - 2)
-    gfx.setColor(8)
-    love.graphics.line(px + pw - 2, py + 1, px + pw - 2, py + ph - 2)
-    love.graphics.line(px + 1, py + ph - 2, px + pw - 2, py + ph - 2)
-
-    -- Title bar
-    gfx.rect(px + 2, py + 2, pw - 4, 10, 1)
-    gfx.print("HELP", px + 4, py + 3, 15)
-    gfx.print("[H] CLOSE", px + pw - 60, py + 3, 14)
-
-    -- Content area
-    local contentY = py + 14
-    local contentH = ph - 28
-    local maxLines = math_floor(contentH / 8)
-    local scroll = helpScroll or 0
-    local totalLines = #lines
-
-    for i = 1, maxLines do
-        local lineIdx = scroll + i
-        if lineIdx > totalLines then break end
-        local line = lines[lineIdx]
-        local col = 7
-        if line:sub(1, 3) == "===" then col = 14 end
-        gfx.print(line, px + 6, contentY + (i - 1) * 8, col)
-    end
-
-    -- Scroll indicator
-    if totalLines > maxLines then
-        local barX = px + pw - 6
-        local barY = contentY
-        local barH = contentH
-        local thumbH = math_max(4, math_floor(barH * maxLines / totalLines))
-        local thumbY = barY + math_floor((barH - thumbH) * scroll / math_max(1, totalLines - maxLines))
-        gfx.rect(barX, barY, 3, barH, 0)
-        gfx.rect(barX, thumbY, 3, thumbH, 7)
-    end
-
-    -- Bottom hint
-    gfx.print("UP/DN:SCROLL  H:CLOSE", px + 6, py + ph - 10, 8)
-end
 
 -- ============================================================================
 -- CART INTERFACE (split into helpers to stay under LuaJIT 60-upvalue limit)
@@ -2201,22 +2310,27 @@ local function initTextures()
     skyQuadObj = nil  -- reset cached skybox quad
 
     local function registerTex(catName, key, img)
-        img:setFilter("nearest", "nearest")
-        img:setWrap("repeat", "repeat")
+        if not img then return end
+        local ok, err = pcall(function()
+            img:setFilter("nearest", "nearest")
+            img:setWrap("repeat", "repeat")
+        end)
+        if not ok then return end
         local data = loadTextureData(img)
+        local w, h = img:getWidth(), img:getHeight()
         local entry = {
             key  = key,
             img  = img,
             data = data,
-            w    = img:getWidth(),
-            h    = img:getHeight(),
+            w    = w,
+            h    = h,
             avgColor = computeAvgColor(data),
         }
         table.insert(texCatalog[catName], entry)
         texByKey[catName .. "/" .. key] = entry
     end
 
-    -- Load wall textures from assets
+    -- Load wall textures from assets (skip missing/invalid; fallbacks added below if empty)
     if assets and assets.categories then
         for key, img in pairs(assets.categories.walls or {}) do
             registerTex("walls", key, img)
@@ -2229,16 +2343,17 @@ local function initTextures()
             registerTex("ceil", key, img)
         end
 
-        -- Load skybox from bg category (first found image)
+        -- Load skybox from bg category (first found image; skip invalid)
         texSky = nil
         texSkyW, texSkyH = 0, 0
         for _, img in pairs(assets.categories.bg or {}) do
-            texSky = img
-            texSky:setFilter("nearest", "nearest")
-            texSky:setWrap("repeat", "clampzero")
-            texSkyW = texSky:getWidth()
-            texSkyH = texSky:getHeight()
-            break  -- use first bg texture as skybox
+            if img and pcall(function() img:setFilter("nearest", "nearest") end) then
+                texSky = img
+                texSky:setWrap("repeat", "clampzero")
+                texSkyW = texSky:getWidth()
+                texSkyH = texSky:getHeight()
+                break  -- use first bg texture as skybox
+            end
         end
     end
 
@@ -2271,17 +2386,19 @@ end
 local function initRendering()
     initQuadMesh()
 
-    -- Init floor/ceiling image (same size as viewport)
+    -- Init floor/ceiling image (same size as viewport); fallback to nil-safe creation
     floorCeilImageData = love.image.newImageData(VP_W, VP_H)
-    floorCeilImage = love.graphics.newImage(floorCeilImageData)
-    floorCeilImage:setFilter("nearest", "nearest")
+    local ok1, img1 = pcall(love.graphics.newImage, floorCeilImageData)
+    floorCeilImage = (ok1 and img1) or nil
+    if floorCeilImage then floorCeilImage:setFilter("nearest", "nearest") end
 
     -- Init low-res floor/ceiling image (half size)
     local lowW = math_floor(VP_W / 2)
     local lowH = math_floor(VP_H / 2)
     floorCeilImageDataLow = love.image.newImageData(lowW, lowH)
-    floorCeilImageLow = love.graphics.newImage(floorCeilImageDataLow)
-    floorCeilImageLow:setFilter("nearest", "nearest")
+    local ok2, img2 = pcall(love.graphics.newImage, floorCeilImageDataLow)
+    floorCeilImageLow = (ok2 and img2) or nil
+    if floorCeilImageLow then floorCeilImageLow:setFilter("nearest", "nearest") end
 
     -- Z-buffer for minimap/debugging
     zBuffer = {}
@@ -2308,12 +2425,12 @@ local function initGameState()
         stamMax = 100, stam = 100,
         dead = false,
         deathTimer = 0,
-        attackCooldown = 0,  -- blocks stam regen while > 0
+        wpn = { state = "IDLE", t = 0, didHit = false, queue = nil, mode = nil, def = nil },
     }
 
     -- Inventory
     inventory = {}
-    for i = 1, INV_SIZE do inventory[i] = nil end
+    for i = 1, INV.SIZE do inventory[i] = nil end
     equipMelee  = nil
     equipRanged = nil
     equipArmor  = nil
@@ -2331,24 +2448,29 @@ local function initGameState()
     projectiles = {}
     screenShake = nil
     meleeFlash = 0
+    stamFlash = 0
 
     -- Torch / lighting
     torchEnabled = true
 
     -- Edit mode state
     mode = "play"
-    cursorX = 1
-    cursorY = 1
-    brushType = TILE_WALL
     stepTimer = 0
-    showHelp = false
-    helpScroll = 0
-    editMode = 1       -- 1=collision, 2=wall, 3=floor, 4=ceil
-    paletteSel = 1     -- (reset to 0 when switching to ceil mode)
-    paletteScroll = 0
+
+    -- Close any active tool
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.close then activeTool.close(cartState, consoleRef) end
+        activeToolId = nil
+    end
 
     -- Tutorial state
     hasMovedOnce = false
+    runFrames = 0
+    pmenu.open = false
+    pmenu.toolsOpen = false
+    pmenu.sel = 1
+    pmenu.toolsSel = 1
 
     -- Message log
     msgLog = {}
@@ -2357,17 +2479,95 @@ local function initGameState()
     addLog("F1:EDIT  ESC:PAUSE")
 end
 
+-- Build the mapAPI table that tools/map_editor uses to access cart state
+local function buildMapAPI()
+    return {
+        -- Map dimensions (updated by reference through the table)
+        mapW = mapW,
+        mapH = mapH,
+        -- Player position (for cursor init)
+        playerX = player and player.x or 2,
+        playerY = player and player.y or 2,
+        playerStartX = playerStartX,
+        playerStartY = playerStartY,
+        -- Tile accessors
+        getTile = getTile,
+        setTile = setTile,
+        -- Material accessors
+        getWallMat = getWallMat,
+        setWallMat = setWallMat,
+        getFloorMat = getFloorMat,
+        setFloorMat = setFloorMat,
+        getCeilMat = getCeilMat,
+        setCeilMat = setCeilMat,
+        -- Texture catalog
+        texCatalog = texCatalog,
+        texByKey = texByKey,
+        resolveTexEntry = resolveTexEntry,
+        -- Enemy spawns (by reference — edits are live)
+        enemySpawns = enemySpawns,
+        -- Save/load
+        saveMap = saveMap,
+        loadMap = loadMapFromFile,
+        -- Callbacks
+        addLog = addLog,
+        onEditorClose = function()
+            mode = "play"
+            applyPlayerStart()
+        end,
+        openTracker = function()
+            local trackerTool = toolRegistry.get("chip_tracker")
+            if trackerTool then
+                trackerTool.open(cartState, consoleRef)
+                activeToolId = "chip_tracker"
+                addLog("TRACKER OPENED")
+            end
+        end,
+    }
+end
+
 function cart.init(console)
     gfx    = console.gfx
     assets = console.assets
     sfx    = console.sfx
     input  = console.input
-    trackerRef = console.tracker
+    sprites = console.sprites
     consoleRef = console
+
+    -- Load tool registry on first init (deferred from top-level so cart loads even if tools fail)
+    if not toolRegistry then
+        local ok, reg = pcall(require, "tools.registry")
+        if ok and reg and reg.init then
+            toolRegistry = reg
+        else
+            toolRegistry = {
+                list = function() return {} end,
+                get = function() return nil end,
+                init = function() end,
+            }
+        end
+    end
+    toolRegistry.init()
+
+    -- Build tools menu from registry
+    pmenu.toolItems = {}
+    pmenu.toolIds = {}
+    local toolList = toolRegistry.list()
+    for _, t in ipairs(toolList) do
+        pmenu.toolItems[#pmenu.toolItems + 1] = t.title
+        pmenu.toolIds[#pmenu.toolIds + 1] = t.id
+    end
+    pmenu.toolItems[#pmenu.toolItems + 1] = "Back"
+    pmenu.toolIds[#pmenu.toolIds + 1] = nil
 
     initTextures()
     initRendering()
     initGameState()
+    initTestNPC()
+    initWeaponOverlay()
+
+    -- Build mapAPI for tools (after state is initialized)
+    cartState.mapAPI = buildMapAPI()
 end
 
 function cart.reset(console)
@@ -2375,6 +2575,19 @@ function cart.reset(console)
 end
 
 function cart.update(dt, console)
+    runFrames = runFrames + 1
+
+    -- Active tool has priority when open
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) then
+            if activeTool.update then activeTool.update(dt, cartState, consoleRef) end
+            return
+        else
+            activeToolId = nil
+        end
+    end
+
     if mode == "edit" then
         -- No continuous update needed in edit mode
         return
@@ -2390,10 +2603,12 @@ function cart.update(dt, console)
         return  -- block all input while dead
     end
 
-    -- Stamina regen (only when not recently attacking)
-    player.attackCooldown = math_max(0, player.attackCooldown - dt)
-    if player.attackCooldown <= 0 then
-        player.stam = math.min(player.stamMax, player.stam + STAM_REGEN * dt)
+    -- Weapon state machine tick
+    weaponUpdate(dt)
+
+    -- Stamina regen (only when weapon is IDLE)
+    if player.wpn.state == "IDLE" then
+        player.stam = math.min(player.stamMax, player.stam + PLAYER_CONST.STAM_REGEN * dt)
     end
 
     -- Update enemies (runs even with inventory open — they don't wait for you)
@@ -2411,6 +2626,11 @@ function cart.update(dt, console)
     -- Melee flash timer
     if meleeFlash > 0 then
         meleeFlash = meleeFlash - dt
+    end
+
+    -- Stamina flash timer
+    if stamFlash and stamFlash > 0 then
+        stamFlash = stamFlash - dt
     end
 
     -- Block movement while inventory is open
@@ -2487,7 +2707,7 @@ function cart.update(dt, console)
 
     -- Stamina drain while walking (MOVE_COST per tile, at MOVE_SPEED tiles/sec)
     if walking then
-        player.stam = math_max(0, player.stam - MOVE_COST * MOVE_SPEED * dt)
+        player.stam = math_max(0, player.stam - PLAYER_CONST.MOVE_COST * MOVE_SPEED * dt)
     end
 
     -- Check for item pickups at player position
@@ -2495,21 +2715,26 @@ function cart.update(dt, console)
         checkPickups()
     end
 
-    -- Footstep sound throttle
+    -- Footstep sound throttle + weapon bob
     if input.held.UP or input.held.DOWN then
         stepTimer = stepTimer + dt
         if stepTimer >= STEP_INTERVAL then
             stepTimer = stepTimer - STEP_INTERVAL
             if sfx then sfx.play("step") end
         end
+        wpnBobTimer = wpnBobTimer + dt
     else
         stepTimer = 0
+        -- Decay bob smoothly to zero
+        if wpnBobTimer > 0 then
+            wpnBobTimer = math_max(0, wpnBobTimer - dt * 4)
+        end
     end
 
     -- Death check
     if player.hp <= 0 and not player.dead then
         player.dead = true
-        player.deathTimer = DEATH_DELAY
+        player.deathTimer = PLAYER_CONST.DEATH_DELAY
         addLog("You died!")
     end
 
@@ -2521,182 +2746,146 @@ function cart.update(dt, console)
     end
 end
 
--- Helper: toggle play/edit mode (shared by F1 key and SELECT action)
-local function toggleEditMode()
-    showHelp = false
-    helpScroll = 0
-    if mode == "play" then
-        mode = "edit"
-        cursorX = clamp(math_floor(player.x), 1, mapW)
-        cursorY = clamp(math_floor(player.y), 1, mapH)
-        addLog("ENTERED EDIT MODE")
+-- Tool state for Pause menu — uses tool registry
+function cart.getToolState(id)
+    local t = toolRegistry.get(id)
+    if t and t.isOpen then return t.isOpen(cartState) end
+    return false
+end
+
+function cart.setToolState(id, open)
+    local t = toolRegistry.get(id)
+    if not t then addLog(id .. " NOT AVAILABLE"); return end
+
+    if open then
+        -- Close any currently active tool first
+        if activeToolId and activeToolId ~= id then
+            local prev = toolRegistry.get(activeToolId)
+            if prev and prev.close then prev.close(cartState, consoleRef) end
+        end
+        -- Map editor needs special handling: set mode to "edit"
+        if id == "map_editor" then
+            mode = "edit"
+            -- Refresh mapAPI with current state
+            cartState.mapAPI = buildMapAPI()
+        end
+        if t.open then t.open(cartState, consoleRef) end
+        activeToolId = id
     else
+        if t.close then t.close(cartState, consoleRef) end
+        if activeToolId == id then activeToolId = nil end
+        if id == "map_editor" then
+            mode = "play"
+            applyPlayerStart()
+        end
+    end
+end
+
+-- Used by app: ESC closes top overlay before opening pause menu
+function cart.hasOverlayOpen()
+    if activeToolId then
+        local t = toolRegistry.get(activeToolId)
+        if t and t.isOpen and t.isOpen(cartState) then return true end
+    end
+    if mode == "edit" then return true end
+    return false
+end
+
+function cart.closeOverlay()
+    if activeToolId then
+        local t = toolRegistry.get(activeToolId)
+        if t and t.isOpen and t.isOpen(cartState) then
+            cart.setToolState(activeToolId, false)
+            return
+        end
+    end
+    if mode == "edit" then
         mode = "play"
         applyPlayerStart()
+        addLog("MAP EDITOR CLOSED")
+    end
+end
+
+-- Helper: toggle play/edit mode (shared by F1 key and SELECT action)
+local function toggleEditMode()
+    if mode == "play" then
+        cart.setToolState("map_editor", true)
+        addLog("ENTERED EDIT MODE")
+    else
+        cart.setToolState("map_editor", false)
         addLog("ENTERED PLAY MODE")
     end
     if sfx then sfx.play("ui_select") end
 end
 
--- Helper: erase/reset at cursor (shared by R key and X action in edit mode)
-local function eraseAtCursor()
-    if editMode == 1 then
-        setTile(cursorX, cursorY, TILE_EMPTY)
-        addLog("CLEARED @" .. cursorX .. "," .. cursorY)
-    elseif editMode == 2 then
-        setWallMat(cursorX, cursorY, "default")
-        addLog("WALL RESET @" .. cursorX .. "," .. cursorY)
-    elseif editMode == 3 then
-        setFloorMat(cursorX, cursorY, "default")
-        addLog("FLOOR RESET @" .. cursorX .. "," .. cursorY)
-    elseif editMode == 4 then
-        setCeilMat(cursorX, cursorY, nil)
-        addLog("CEIL->SKY @" .. cursorX .. "," .. cursorY)
-    elseif editMode == 5 then
-        -- Remove enemy spawn at cursor
-        for i = #enemySpawns, 1, -1 do
-            if enemySpawns[i].x == cursorX and enemySpawns[i].y == cursorY then
-                table.remove(enemySpawns, i)
-                addLog("SPAWN REMOVED @" .. cursorX .. "," .. cursorY)
-            end
-        end
-    end
-    if sfx then sfx.play("paint") end
-end
-
--- Helper: cycle edit submode forward 1->2->3->4->1
-local function cycleEditSubmode()
-    editMode = editMode + 1
-    if editMode > 5 then editMode = 1 end
-    paletteSel = (editMode == 4) and 0 or 1
-    paletteScroll = 0
-    addLog("MODE: " .. EDIT_MODE_NAMES[editMode])
-    if sfx then sfx.play("ui_move") end
-end
-
--- Helper: cycle palette selection forward (shared by E key and B action in material modes)
-local function paletteNext()
-    local list = getPaletteList()
-    if not list or #list == 0 then return end
-    local minSel = (editMode == 4) and 0 or 1
-    paletteSel = paletteSel + 1
-    if paletteSel > #list then paletteSel = minSel end
-    local label = (paletteSel == 0) and "OPEN SKY" or list[paletteSel].key:sub(1, 12)
-    addLog("SEL: " .. label)
-    if sfx then sfx.play("ui_move") end
-end
-
--- Helper: cycle palette selection backward (shared by Q key)
-local function palettePrev()
-    local list = getPaletteList()
-    if not list or #list == 0 then return end
-    local minSel = (editMode == 4) and 0 or 1
-    paletteSel = paletteSel - 1
-    if paletteSel < minSel then paletteSel = #list end
-    local label = (paletteSel == 0) and "OPEN SKY" or list[paletteSel].key:sub(1, 12)
-    addLog("SEL: " .. label)
-    if sfx then sfx.play("ui_move") end
-end
 
 function cart.input(action, pressed, console)
     if not pressed then return end
 
-    -- SELECT toggles edit/play mode (same as F1) from any mode
-    if action == "SELECT" then
-        toggleEditMode()
+    -- 1) Pause menu open: menu consumes input
+    if pmenu.open then
+        if pmenu.toolsOpen then
+            if action == "UP" then pmenu.toolsSel = math.max(1, pmenu.toolsSel - 1); if sfx then sfx.play("ui_move") end; return end
+            if action == "DOWN" then pmenu.toolsSel = math.min(#pmenu.toolItems, pmenu.toolsSel + 1); if sfx then sfx.play("ui_move") end; return end
+            if action == "A" then
+                if sfx then sfx.play("ui_select") end
+                local id = pmenu.toolIds[pmenu.toolsSel]
+                if id then
+                    cart.setToolState(id, true)
+                    pmenu.open = false
+                    pmenu.toolsOpen = false
+                else
+                    pmenu.toolsOpen = false
+                end
+                return
+            end
+            if action == "B" or action == "START" then pmenu.toolsOpen = false; if sfx then sfx.play("ui_select") end; return end
+        else
+            if action == "UP" then pmenu.sel = (pmenu.sel - 2) % #pmenu.items + 1; if sfx then sfx.play("ui_move") end; return end
+            if action == "DOWN" then pmenu.sel = pmenu.sel % #pmenu.items + 1; if sfx then sfx.play("ui_move") end; return end
+            if action == "A" then
+                if sfx then sfx.play("ui_select") end
+                local sel = pmenu.items[pmenu.sel]
+                if sel == "Resume" then pmenu.open = false
+                elseif sel == "Tools >" then pmenu.toolsOpen = true; pmenu.toolsSel = 1
+                elseif sel == "Settings >" then pmenu.open = false; if consoleRef then consoleRef.requestOpenSettings = true end
+                elseif sel == "Reset Cart" then pmenu.open = false; if cart.reset then cart.reset(console) end
+                elseif sel == "Quit to Program Manager" then if consoleRef then consoleRef.requestQuitToMenu = true end
+                end
+                return
+            end
+            if action == "B" or action == "START" then pmenu.open = false; if sfx then sfx.play("ui_select") end; return end
+        end
         return
     end
 
-    if mode == "edit" then
-        -- Block all mapped actions while help is showing
-        if showHelp then
-            -- Y closes help when it's open
-            if action == "Y" then
-                showHelp = false
-                helpScroll = 0
-            end
+    -- 2) START/ESC: open pause menu (or close tool if one is open)
+    if action == "START" then
+        if cart.hasOverlayOpen() then
+            cart.closeOverlay()
+            if sfx then sfx.play("ui_select") end
+        else
+            pmenu.open = true
+            pmenu.sel = 1
+            pmenu.toolsOpen = false
+            if sfx then sfx.play("ui_select") end
+        end
+        return
+    end
+
+    -- 3) Active tool consumes all mapped input when open
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) and activeTool.input then
+            activeTool.input(action, pressed, cartState, consoleRef)
             return
         end
-        -- Edit mode controls via mapped actions
-        if action == "UP" then
-            cursorY = math_max(1, cursorY - 1)
-        elseif action == "DOWN" then
-            cursorY = math_min(mapH, cursorY + 1)
-        elseif action == "LEFT" then
-            cursorX = math_max(1, cursorX - 1)
-        elseif action == "RIGHT" then
-            cursorX = math_min(mapW, cursorX + 1)
-        elseif action == "A" then
-            if editMode == 1 then
-                -- Paint collision tile
-                if brushType == TILE_START then
-                    for y = 1, mapH do
-                        for x = 1, mapW do
-                            if getTile(x, y) == TILE_START then
-                                setTile(x, y, TILE_EMPTY)
-                            end
-                        end
-                    end
-                    playerStartX = cursorX
-                    playerStartY = cursorY
-                end
-                setTile(cursorX, cursorY, brushType)
-                addLog("PLACED " .. (TILE_NAMES[brushType] or "?") .. " @" .. cursorX .. "," .. cursorY)
-            elseif editMode == 2 then
-                local key = getSelectedMatKey()
-                setWallMat(cursorX, cursorY, key)
-                addLog("WALL:" .. key:sub(1, 10) .. " @" .. cursorX .. "," .. cursorY)
-            elseif editMode == 3 then
-                local key = getSelectedMatKey()
-                setFloorMat(cursorX, cursorY, key)
-                addLog("FLOOR:" .. key:sub(1, 10) .. " @" .. cursorX .. "," .. cursorY)
-            elseif editMode == 4 then
-                local key = getSelectedMatKey()
-                setCeilMat(cursorX, cursorY, key)
-                local label = key and key:sub(1, 10) or "OPEN SKY"
-                addLog("CEIL:" .. label .. " @" .. cursorX .. "," .. cursorY)
-            elseif editMode == 5 then
-                -- Place enemy spawn at cursor (no duplicates on same tile)
-                local exists = false
-                for _, s in ipairs(enemySpawns) do
-                    if s.x == cursorX and s.y == cursorY then exists = true; break end
-                end
-                if not exists then
-                    enemySpawns[#enemySpawns + 1] = { x = cursorX, y = cursorY }
-                    addLog("ENEMY SPAWN @" .. cursorX .. "," .. cursorY)
-                else
-                    addLog("SPAWN EXISTS HERE")
-                end
-            end
-            if sfx then sfx.play("paint") end
-        elseif action == "B" then
-            if editMode == 1 then
-                -- Cycle brush (collision mode only)
-                local idx = 1
-                for i, bt in ipairs(BRUSH_ORDER) do
-                    if bt == brushType then idx = i; break end
-                end
-                idx = idx + 1
-                if idx > #BRUSH_ORDER then idx = 1 end
-                brushType = BRUSH_ORDER[idx]
-                addLog("BRUSH: " .. (TILE_NAMES[brushType] or "?"))
-            else
-                -- Material modes: cycle palette forward
-                paletteNext()
-            end
-            if editMode == 1 then
-                if sfx then sfx.play("ui_move") end
-            end
-        elseif action == "X" then
-            -- Erase / reset at cursor
-            eraseAtCursor()
-        elseif action == "Y" then
-            -- Toggle help overlay
-            showHelp = not showHelp
-            helpScroll = 0
-        elseif action == "L1" then
-            -- Cycle edit submode (collision / wall mat / floor mat / ceil mat)
-            cycleEditSubmode()
+    end
+
+    -- SELECT toggles edit/play mode (same as F1) — ignore for first 15 frames to avoid menu key carry-over
+    if action == "SELECT" then
+        if runFrames > 15 then
+            toggleEditMode()
         end
         return
     end
@@ -2704,20 +2893,20 @@ function cart.input(action, pressed, console)
     -- PLAY MODE: inventory open — handle inventory navigation
     if invOpen then
         if action == "UP" then
-            invCursor = invCursor - INV_COLS
-            if invCursor < 0 then invCursor = invCursor + INV_SIZE end
+            invCursor = invCursor - INV.COLS
+            if invCursor < 0 then invCursor = invCursor + INV.SIZE end
             if sfx then sfx.play("ui_move") end
         elseif action == "DOWN" then
-            invCursor = invCursor + INV_COLS
-            if invCursor >= INV_SIZE then invCursor = invCursor - INV_SIZE end
+            invCursor = invCursor + INV.COLS
+            if invCursor >= INV.SIZE then invCursor = invCursor - INV.SIZE end
             if sfx then sfx.play("ui_move") end
         elseif action == "LEFT" then
             invCursor = invCursor - 1
-            if invCursor < 0 then invCursor = INV_SIZE - 1 end
+            if invCursor < 0 then invCursor = INV.SIZE - 1 end
             if sfx then sfx.play("ui_move") end
         elseif action == "RIGHT" then
             invCursor = invCursor + 1
-            if invCursor >= INV_SIZE then invCursor = 0 end
+            if invCursor >= INV.SIZE then invCursor = 0 end
             if sfx then sfx.play("ui_move") end
         elseif action == "A" then
             invUseItem(invCursor + 1)
@@ -2731,11 +2920,11 @@ function cart.input(action, pressed, console)
     -- PLAY MODE: normal controls
     if player.dead then return end
     if action == "A" then
-        -- Melee attack
-        doMeleeAttack()
+        -- Melee attack (or queue if mid-swing)
+        weaponStartAttack("melee")
     elseif action == "B" then
-        -- Ranged attack
-        doRangedAttack()
+        -- Ranged attack (or queue if mid-action)
+        weaponStartAttack("ranged")
     elseif action == "Y" then
         -- Toggle inventory
         invOpen = true
@@ -2748,10 +2937,17 @@ function cart.input(action, pressed, console)
 end
 
 function cart.keypressed(key)
-    -- Auto-close help overlay on escape
-    if key == "escape" then
-        showHelp = false
-        helpScroll = 0
+    -- Active tool captures keypresses when open
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) then
+            if key == "escape" then
+                cart.setToolState(activeToolId, false)
+                return
+            end
+            if activeTool.keypressed then activeTool.keypressed(key, cartState, consoleRef) end
+            return
+        end
     end
 
     if key == "f1" then
@@ -2779,85 +2975,25 @@ function cart.keypressed(key)
         addLog("TORCH " .. (torchEnabled and "ON" or "OFF"))
         return
     end
-
-    if mode == "edit" then
-        -- Help overlay toggle and scroll
-        if key == "h" then
-            showHelp = not showHelp
-            helpScroll = 0
-            return
-        end
-        if showHelp then
-            -- Only handle scroll keys when help is open
-            local maxScroll = math_max(0, #EDIT_HELP_LINES - math_floor(132 / 8))
-            if key == "up" then
-                helpScroll = math_max(0, helpScroll - 1)
-            elseif key == "down" then
-                helpScroll = math_min(maxScroll, helpScroll + 1)
-            elseif key == "pageup" then
-                helpScroll = math_max(0, helpScroll - 8)
-            elseif key == "pagedown" then
-                helpScroll = math_min(maxScroll, helpScroll + 8)
-            end
-            return  -- consume all keys while help is open
-        end
-        -- Edit mode number keys: switch paint mode
-        if key == "1" then editMode = 1; paletteSel = 1; paletteScroll = 0; addLog("MODE: COLLISION"); return
-        elseif key == "2" then editMode = 2; paletteSel = 1; paletteScroll = 0; addLog("MODE: WALL MAT"); return
-        elseif key == "3" then editMode = 3; paletteSel = 1; paletteScroll = 0; addLog("MODE: FLOOR MAT"); return
-        elseif key == "4" then editMode = 4; paletteSel = 0; paletteScroll = 0; addLog("MODE: CEIL MAT"); return
-        elseif key == "5" then editMode = 5; paletteSel = 1; paletteScroll = 0; addLog("MODE: ENEMIES"); return
-        end
-        -- Palette navigation (material modes only)
-        if editMode >= 2 then
-            if key == "q" then palettePrev(); return
-            elseif key == "e" then paletteNext(); return
-            end
-        end
-        if key == "r" then
-            eraseAtCursor()
-        elseif key == "s" then
-            saveMap()
-            if sfx then sfx.play("save") end
-        elseif key == "l" then
-            if loadMapFromFile() then
-                addLog("MAP LOADED!")
-                if sfx then sfx.play("load") end
-            else
-                addLog("NO SAVED MAP")
-                if sfx then sfx.play("bump") end
-            end
-        elseif key == "p" then
-            -- Test play: switch to play mode at player start
-            mode = "play"
-            applyPlayerStart()
-            addLog("TEST PLAY")
-        elseif key == "t" then
-            -- Open tracker editor
-            if trackerRef then
-                trackerRef.open()
-                addLog("TRACKER OPENED")
-                if sfx then sfx.play("ui_select") end
-            end
-        end
-    end
 end
 
 function cart.draw(console)
-    if mode == "edit" then
-        -- Edit mode: top-down grid + panel
-        drawEditGrid()
-        drawEditPanel()
-        drawMessageBox()
-        if showHelp then
-            drawHelpOverlay(EDIT_HELP_LINES)
+    -- Declare at top so goto drawPauseMenu does not jump into their scope (Lua rule)
+    local shakeX, shakeY = 0, 0
+
+    -- If map editor (or another full-screen tool) is active, let it draw
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) and activeTool.draw then
+            activeTool.draw(cartState, consoleRef)
+            -- Still draw pause menu on top if open
+            if pmenu.open then goto drawPauseMenu end
+            return
         end
-        return
     end
 
     -- PLAY MODE
     -- Screen shake offset
-    local shakeX, shakeY = 0, 0
     if screenShake then
         local intensity = screenShake.intensity
         shakeX = math.random(-intensity, intensity)
@@ -2872,6 +3008,9 @@ function cart.draw(console)
 
     -- Viewport
     drawViewport()
+
+    -- First-person weapon + hands overlay
+    drawWeaponOverlay()
 
     -- Melee flash overlay (brief white flash on viewport)
     if meleeFlash > 0 then
@@ -2912,6 +3051,60 @@ function cart.draw(console)
 
     -- Inventory overlay (drawn last, on top of everything)
     drawInventory()
+
+    -- Pause menu overlay (inside cart)
+    ::drawPauseMenu::
+    if pmenu.open then
+        gfx.setColorRGBA(0, 0, 0, 0.6)
+        love.graphics.rectangle("fill", 0, 0, VIRT_W, VIRT_H)
+        local pw, ph = 200, 130
+        local px = math_floor((VIRT_W - pw) / 2)
+        local py = math_floor((VIRT_H - ph) / 2)
+        drawBevel(px, py, pw, ph)
+        gfx.rect(px + 2, py + 2, pw - 4, 14, 1)
+        gfx.print("PAUSED", px + math_floor((pw - gfx.textWidth("PAUSED")) / 2), py + 4, 15)
+        local by = py + 20
+        local items = pmenu.toolsOpen and pmenu.toolItems or pmenu.items
+        local curSel = pmenu.toolsOpen and pmenu.toolsSel or pmenu.sel
+        for i = 1, #items do
+            local label = items[i]
+            if pmenu.toolsOpen and pmenu.toolIds[i] and cart.getToolState(pmenu.toolIds[i]) then
+                label = label .. "  [ON]"
+            elseif pmenu.toolsOpen and pmenu.toolIds[i] then
+                label = label .. "  [OFF]"
+            end
+            local col = (i == curSel) and 15 or 7
+            gfx.print(label, px + 8, by + (i - 1) * 12, col)
+        end
+        gfx.print("ESC/B:BACK  A:SELECT", px + 4, py + ph - 12, 8)
+    end
+end
+
+function cart.textinput(text)
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) and activeTool.textinput then
+            activeTool.textinput(text, cartState, consoleRef)
+        end
+    end
+end
+
+function cart.mousepressed(x, y, button, console)
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) and activeTool.mousepressed then
+            activeTool.mousepressed(x, y, button, cartState, consoleRef)
+        end
+    end
+end
+
+function cart.mousereleased(x, y, button, console)
+    if activeToolId then
+        local activeTool = toolRegistry.get(activeToolId)
+        if activeTool and activeTool.isOpen(cartState) and activeTool.mousereleased then
+            activeTool.mousereleased(x, y, button, cartState, consoleRef)
+        end
+    end
 end
 
 return cart

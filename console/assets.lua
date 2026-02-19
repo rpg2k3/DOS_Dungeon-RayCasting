@@ -58,4 +58,58 @@ function assets.init()
     assets.loadCategory("bg")
 end
 
+--- Load user-made sprite textures from the save directory into asset categories.
+--- Sprite textures in sprites/textures/{walls,floor,roof,bg}/ are composited
+--- into love.Image objects and added to assets.categories alongside PNG textures.
+--- @param spritesModule table  the console.sprites module (must have setPalette called already)
+function assets.loadSpriteTextures(spritesModule)
+    if not spritesModule then return end
+    local kinds = { "walls", "floor", "roof", "bg" }
+    -- Map sprite texture kinds to asset category names (same names)
+    for _, kind in ipairs(kinds) do
+        local assetNames = spritesModule.listTextureAssets(kind)
+        for _, name in ipairs(assetNames) do
+            -- Skip if a PNG texture with same key already exists
+            if not assets.categories[kind][name] then
+                local asset, err = spritesModule.loadAsset("textures/" .. kind .. "/" .. name)
+                if asset then
+                    local ok, imgData = pcall(spritesModule.compositeFrame, asset, 1)
+                    if ok and imgData then
+                        local img = love.graphics.newImage(imgData)
+                        img:setFilter("nearest", "nearest")
+                        if kind == "bg" then
+                            img:setWrap("repeat", "clampzero")
+                        else
+                            img:setWrap("repeat", "repeat")
+                        end
+                        assets.categories[kind][name] = img
+                        assets.images["sprite:" .. kind .. "/" .. name] = img
+                    end
+                end
+            end
+        end
+    end
+end
+
+--- Reload a single sprite texture by kind and name (after editing/saving in sprite editor).
+--- @param spritesModule table  the console.sprites module
+--- @param kind string  "walls", "floor", "roof", or "bg"
+--- @param name string  asset name (e.g. "brick_01")
+function assets.reloadSpriteTexture(spritesModule, kind, name)
+    if not spritesModule then return end
+    local asset, err = spritesModule.loadAsset("textures/" .. kind .. "/" .. name)
+    if not asset then return end
+    local ok, imgData = pcall(spritesModule.compositeFrame, asset, 1)
+    if not ok or not imgData then return end
+    local img = love.graphics.newImage(imgData)
+    img:setFilter("nearest", "nearest")
+    if kind == "bg" then
+        img:setWrap("repeat", "clampzero")
+    else
+        img:setWrap("repeat", "repeat")
+    end
+    assets.categories[kind][name] = img
+    assets.images["sprite:" .. kind .. "/" .. name] = img
+end
+
 return assets

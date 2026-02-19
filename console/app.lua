@@ -7,6 +7,7 @@ local assets  = require("console.assets")
 local carts   = require("console.carts")
 local theme   = require("console.theme")
 local tracker = require("console.tracker")
+local sprites = require("console.sprites")
 
 local app = {}
 
@@ -18,9 +19,12 @@ local console = {
     storage = storage,
     input   = input,
     assets  = assets,
+    sprites = sprites,
     tracker = tracker,
+    theme   = theme,
     time    = { dt = 0, frame = 0, total = 0 },
     state   = "BOOT",
+    requestOpenSettings = false,
     texturesEnabled = true,
     brightness = 5,
     renderScale = "CRISP",  -- "CRISP" or "LOW"
@@ -42,11 +46,11 @@ local pauseSel     = 1   -- 1=Resume, 2=Reset, 3=Settings, 4=Menu
 local settingsSel  = 1   -- selected row in settings dialog
 local settingsFrom = nil -- "MENU" or "PAUSED", so we return to the right place
 
--- Settings defaults
+-- Settings defaults (textures on, CRT on, brightness 1.0/full, others as below)
 local SETTINGS_DEFAULTS = {
     crt           = false,
     textures      = true,
-    brightness    = 5,       -- 1-10 scale
+    brightness    = 10,      -- 1-10 scale (10 = full)
     renderScale   = "CRISP", -- "CRISP" or "LOW"
     fovDeg        = 60,      -- 45-90
     fogStrength   = 10,      -- 0-20 (displayed as 0.0-2.0)
@@ -294,21 +298,45 @@ local function updateRunning(dt)
     if tracker.wasJustClosed() then
         return
     end
-    -- check pause
-    if input.justPressed.START then
-        sfx.play("ui_select")
-        pauseSel = 1
-        switchState("PAUSED")
-        return
-    end
-    -- fire input events to cart
-    for _, a in ipairs({"LEFT","RIGHT","UP","DOWN","A","B","SELECT","X","Y","L1"}) do
+    -- fire input events to cart (including START so cart can open its own pause menu when handlesStart)
+    for _, a in ipairs({"LEFT","RIGHT","UP","DOWN","A","B","SELECT","X","Y","L1","START"}) do
         if input.justPressed[a] then fireCartInput(a, true) end
         if input.justReleased[a] then fireCartInput(a, false) end
+    end
+    -- If START pressed and cart does not handle it, open app pause menu (for carts without built-in pause)
+    if input.justPressed.START and not (currentCart and currentCart.handlesStart) then
+        if currentCart and currentCart.hasOverlayOpen and currentCart.hasOverlayOpen() then
+            currentCart.closeOverlay()
+            sfx.play("ui_select")
+        else
+            sfx.play("ui_select")
+            pauseSel = 1
+            toolsMenuOpen = false
+            if currentCart and currentCart.getToolState and currentCart.setToolState then
+                pauseItems = PAUSE_ITEMS_BASE
+            else
+                pauseItems = PAUSE_ITEMS_NO_TOOLS
+            end
+            switchState("PAUSED")
+        end
+        return
     end
     -- update cart
     if currentCart and currentCart.update then
         currentCart.update(dt, console)
+    end
+    -- Cart requested open settings (e.g. from Pause > Settings >)
+    if console.requestOpenSettings then
+        console.requestOpenSettings = false
+        settingsSel = 2
+        settingsFrom = "PAUSED"
+        switchState("SETTINGS")
+    end
+    -- Cart requested exit to menu (Quit to Program Manager)
+    if console.requestQuitToMenu then
+        console.requestQuitToMenu = false
+        currentCart = nil
+        switchState("MENU")
     end
 end
 
@@ -325,32 +353,78 @@ end
 ----------------------------------------------------------------
 -- State: PAUSED  (Win3.1 modal dialog over game)
 ----------------------------------------------------------------
-local PAUSE_ITEMS = {"RESUME", "RESET", "SETTINGS", "QUIT TO MENU"}
+local PAUSE_ITEMS_BASE = {"RESUME", "TOOLS >", "SETTINGS >", "RESET CART", "QUIT TO CART SELECTION"}
+local PAUSE_ITEMS_NO_TOOLS = {"RESUME", "SETTINGS >", "RESET CART", "QUIT TO CART SELECTION"}
+local pauseItems = PAUSE_ITEMS_NO_TOOLS  -- set dynamically when pausing
+
+-- Tools submenu state
+local toolsMenuOpen = false
+local toolsSel = 1
+local TOOLS_ITEMS = {"MAP EDITOR", "SPRITE EDITOR", "CHIP TRACKER", "BACK"}
+local TOOLS_IDS   = {"map_editor", "sprite_editor", "chip_tracker", nil}
 
 local function updatePaused()
-    -- navigate buttons
+    -- Tools submenu active
+    if toolsMenuOpen then
+        if input.justPressed.UP then
+            toolsSel = toolsSel - 1
+            if toolsSel < 1 then toolsSel = #TOOLS_ITEMS end
+            sfx.play("ui_move")
+        end
+        if input.justPressed.DOWN then
+            toolsSel = toolsSel + 1
+            if toolsSel > #TOOLS_ITEMS then toolsSel = 1 end
+            sfx.play("ui_move")
+        end
+        if input.justPressed.A then
+            sfx.play("ui_select")
+            local toolId = TOOLS_IDS[toolsSel]
+            if toolId then
+                -- Open tool and resume game
+                if currentCart and currentCart.setToolState then
+                    currentCart.setToolState(toolId, true)
+                end
+                toolsMenuOpen = false
+                switchState("RUNNING")
+            else
+                -- BACK
+                toolsMenuOpen = false
+            end
+        end
+        if input.justPressed.B or input.justPressed.START then
+            sfx.play("ui_select")
+            toolsMenuOpen = false
+        end
+        return
+    end
+
+    -- Main pause menu navigation
     if input.justPressed.UP then
         pauseSel = pauseSel - 1
-        if pauseSel < 1 then pauseSel = #PAUSE_ITEMS end
+        if pauseSel < 1 then pauseSel = #pauseItems end
         sfx.play("ui_move")
     end
     if input.justPressed.DOWN then
         pauseSel = pauseSel + 1
-        if pauseSel > #PAUSE_ITEMS then pauseSel = 1 end
+        if pauseSel > #pauseItems then pauseSel = 1 end
         sfx.play("ui_move")
     end
     if input.justPressed.A then
         sfx.play("ui_select")
-        if pauseSel == 1 then
+        local sel = pauseItems[pauseSel]
+        if sel == "RESUME" then
             switchState("RUNNING")
-        elseif pauseSel == 2 then
+        elseif sel == "TOOLS >" then
+            toolsMenuOpen = true
+            toolsSel = 1
+        elseif sel == "RESET CART" then
             resetCart()
             switchState("RUNNING")
-        elseif pauseSel == 3 then
+        elseif sel == "SETTINGS >" then
             settingsSel = 2  -- skip header row
             settingsFrom = "PAUSED"
             switchState("SETTINGS")
-        elseif pauseSel == 4 then
+        elseif sel == "QUIT TO CART SELECTION" then
             currentCart = nil
             switchState("MENU")
         end
@@ -370,24 +444,41 @@ local function drawPaused()
     gfx.setColorRGBA(0, 0, 0, 0.55)
     love.graphics.rectangle("fill", 0, 0, gfx.VIRT_W, gfx.VIRT_H)
 
-    -- centered Win3.1 dialog window
-    local pw, ph = 160, 110
-    local px = math.floor((gfx.VIRT_W - pw) / 2)
-    local py = math.floor((gfx.VIRT_H - ph) / 2)
+    if toolsMenuOpen then
+        -- Tools submenu dialog
+        local pw, ph = 160, 16 + #TOOLS_ITEMS * 20 + 14
+        local px = math.floor((gfx.VIRT_W - pw) / 2)
+        local py = math.floor((gfx.VIRT_H - ph) / 2)
 
-    local bx, by, bw, bh = theme.window(gfx, px, py, pw, ph, "PAUSED")
+        local bx, by, bw, bh = theme.window(gfx, px, py, pw, ph, "TOOLS")
 
-    -- button column
-    local btnW, btnH = bw - 16, 16
-    local btnX = bx + 8
-    for i, label in ipairs(PAUSE_ITEMS) do
-        local btnY = by + 4 + (i - 1) * (btnH + 4)
-        local sel = (i == pauseSel)
-        theme.button(gfx, btnX, btnY, btnW, btnH, label, sel)
+        local btnW, btnH = bw - 16, 16
+        local btnX = bx + 8
+        for i, label in ipairs(TOOLS_ITEMS) do
+            local btnY = by + 4 + (i - 1) * (btnH + 4)
+            local sel = (i == toolsSel)
+            theme.button(gfx, btnX, btnY, btnW, btnH, label, sel)
+        end
+
+        gfx.print("A:OPEN  B:BACK", px + 4, py + ph - 14, theme.C.disabled)
+    else
+        -- Main pause dialog
+        local pw, ph = 160, 16 + #pauseItems * 20 + 14
+        local px = math.floor((gfx.VIRT_W - pw) / 2)
+        local py = math.floor((gfx.VIRT_H - ph) / 2)
+
+        local bx, by, bw, bh = theme.window(gfx, px, py, pw, ph, "PAUSED")
+
+        local btnW, btnH = bw - 16, 16
+        local btnX = bx + 8
+        for i, label in ipairs(pauseItems) do
+            local btnY = by + 4 + (i - 1) * (btnH + 4)
+            local sel = (i == pauseSel)
+            theme.button(gfx, btnX, btnY, btnW, btnH, label, sel)
+        end
+
+        gfx.print("START/B:RESUME  A:SELECT", px + 4, py + ph - 14, theme.C.disabled)
     end
-
-    -- hint
-    gfx.print("START/B:RESUME  A:SELECT", px + 4, py + ph - 14, theme.C.disabled)
 end
 
 ----------------------------------------------------------------
@@ -661,6 +752,9 @@ function app.init()
     storage.init()
     loadSettings()
     assets.init()
+    sprites.setPalette(gfx.palette)
+    sprites.ensureFolders()
+    assets.loadSpriteTextures(sprites)
     carts.init()
     tracker.init(console)
     -- hide system cursor
@@ -722,6 +816,12 @@ function app.keypressed(key)
     end
 end
 
+function app.textinput(text)
+    if state == "RUNNING" and currentCart and currentCart.textinput then
+        currentCart.textinput(text)
+    end
+end
+
 function app.keyreleased(key)
     input.keyreleased(key)
 end
@@ -740,6 +840,18 @@ end
 
 function app.joystickremoved(joy)
     input.joystickremoved(joy)
+end
+
+function app.mousepressed(x, y, button)
+    if state == "RUNNING" and currentCart and currentCart.mousepressed then
+        currentCart.mousepressed(x, y, button, console)
+    end
+end
+
+function app.mousereleased(x, y, button)
+    if state == "RUNNING" and currentCart and currentCart.mousereleased then
+        currentCart.mousereleased(x, y, button, console)
+    end
 end
 
 function app.resize(w, h)
